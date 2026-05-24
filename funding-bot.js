@@ -90,6 +90,42 @@ function loadState() {
 }
 function saveState(s) { writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)) }
 
+async function syncPositionsFromHL() {
+  try {
+    const state = loadState()
+    let hlPositions = []
+    try {
+      const cs = await hl.info.clearinghouseState({ user: identity.hl.address })
+      hlPositions = cs?.assetPositions ?? []
+    } catch {
+      const acc = await hl.getAccountState(identity.hl.address)
+      hlPositions = acc?.assetPositions ?? acc?.positions ?? []
+    }
+    let synced = 0
+    for (const ap of hlPositions) {
+      const pos = ap?.position ?? ap
+      if (!pos) continue
+      const asset = pos.coin ?? pos.asset
+      const szi = parseFloat(pos.szi ?? pos.size ?? '0')
+      if (!asset || Math.abs(szi) < 0.0001 || EXCLUDED.has(asset)) continue
+      if (!state.positions[asset]) {
+        const isBuy = szi > 0
+        const entryPx = parseFloat(pos.entryPx ?? pos.entryPrice ?? '0')
+        const now = Date.now()
+        state.positions[asset] = {
+          isBuy, entryPrice: entryPx, openedAt: now,
+          fundingAPR: 0, sizeUsd: Math.abs(szi) * entryPx,
+          settlesAt: now + hoursUntilNextSettlement() * 3600000,
+        }
+        synced++
+        log(`[sync] Recovered ${isBuy?'LONG':'SHORT'} ${asset} @ ${entryPx} from Hyperliquid`)
+      }
+    }
+    if (synced > 0) saveState(state)
+    log(`[sync] ${hlPositions.length} HL positions checked, ${synced} recovered`)
+  } catch (e) { log('[sync] Error:', e.message) }
+}
+
 // Funding settles at 00:00, 08:00, 16:00 UTC every day
 function hoursUntilNextSettlement() {
   const now = new Date()
@@ -1176,5 +1212,6 @@ log(`=== Funding Bot Starting ===`)
 log(`Mode: ${CFG.dryRun ? 'DRY RUN' : 'LIVE'} | Wallet: ${identity.hl.address}`)
 log(`$${CFG.positionUsd}/pos | ${CFG.leverage}x | SL ${CFG.stopLossPct}% | max ${CFG.maxHoldHours}h | threshold ${CFG.minFundingApr}% APR`)
 
+await syncPositionsFromHL()
 await scan()
 scheduleScan()
