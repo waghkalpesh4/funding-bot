@@ -1,0 +1,11 @@
+{
+  "name": "funding-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node funding-bot.js"
+  },
+  "dependencies": {
+    "@b402ai/trader": "^0.2.3"
+  }
+}
