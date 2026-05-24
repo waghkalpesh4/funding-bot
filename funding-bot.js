@@ -1107,6 +1107,7 @@ setInterval(refresh, 15000)
 // ── HTTP SERVER ────────────────────────────────────────────────────────────────
 createServer(async (req, res) => {
   try {
+  log(`HTTP ${req.method} ${req.url}`)
   const url    = req.url
   const method = req.method
 
@@ -1114,6 +1115,8 @@ createServer(async (req, res) => {
     res.writeHead(code, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
     res.end(JSON.stringify(data))
   }
+
+  if (url === '/health') { res.writeHead(200); res.end('ok'); return }
 
   if (method === 'GET' && url === '/') {
     res.writeHead(200, { 'Content-Type': 'text/html' })
