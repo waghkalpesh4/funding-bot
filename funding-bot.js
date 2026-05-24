@@ -1106,6 +1106,7 @@ setInterval(refresh, 15000)
 
 // ── HTTP SERVER ────────────────────────────────────────────────────────────────
 createServer(async (req, res) => {
+  try {
   const url    = req.url
   const method = req.method
 
@@ -1159,6 +1160,10 @@ createServer(async (req, res) => {
   }
 
   res.writeHead(404); res.end()
+  } catch (e) {
+    log('HTTP handler error:', e.message)
+    try { res.writeHead(500); res.end('Internal Server Error') } catch {}
+  }
 }).listen(PORT, () => {
   log(`Dashboard: http://localhost:${PORT}`)
 })
