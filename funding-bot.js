@@ -1167,8 +1167,8 @@ createServer(async (req, res) => {
     log('HTTP handler error:', e.message)
     try { res.writeHead(500); res.end('Internal Server Error') } catch {}
   }
-}).listen(PORT, () => {
-  log(`Dashboard: http://localhost:${PORT}`)
+}).listen(PORT, '0.0.0.0', () => {
+  log(`Dashboard: http://0.0.0.0:${PORT}`)
 })
 
 // ── BOOT ──────────────────────────────────────────────────────────────────────
