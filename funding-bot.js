@@ -13,10 +13,6 @@ import { homedir } from 'os'
 import { createRequire } from 'module'
 
 const _require = createRequire(import.meta.url)
-// Resolve sub-deps from trader's perspective (handles npm hoisting)
-const _traderRequire = createRequire(
-  _require.resolve('@b402ai/trader/package.json')
-)
 
 // ── CONFIG (editable from dashboard) ──────────────────────────────────────────
 let CFG = {
@@ -63,7 +59,7 @@ const privateKey = process.env.PRIVATE_KEY ||
     if (!existsSync(wf)) throw new Error('Set PRIVATE_KEY env var or provide ~/.b402/wallet.json')
     return JSON.parse(readFileSync(wf, 'utf8')).privateKey
   })()
-const { ethers }            = await import(u(_traderRequire.resolve('ethers/dist/ethers.js')))
+const ethers                = await import('ethers')
 const { HyperliquidClient } = await import(u(join(PKG_DIST, 'hyperliquid/client.js')))
 const { spawnAgent }        = await import(u(join(PKG_DIST, 'identity/derivation.js')))
 
