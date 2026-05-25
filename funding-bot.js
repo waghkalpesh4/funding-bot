@@ -17,7 +17,7 @@ const _require = createRequire(import.meta.url)
 // ── CONFIG (editable from dashboard) ──────────────────────────────────────────
 let CFG = {
   dryRun:         false,
-  maxPositions:   2,
+  maxPositions:   4,
   positionUsd:    20,
   leverage:       1,
   stopLossPct:      1.5,
@@ -27,10 +27,10 @@ let CFG = {
   dynamicSizing:        true, // scale position size with APR
   maxPositionUsd:       60,   // max size when APR >= highAprThreshold
   maxHoldHours:     8,
-  minFundingApr:    30,
+  minFundingApr:    60,       // raised: 30%+ too marginal, focus on 60%+ quality yield
   minHoursToSettle: 0.1,  // don't enter in last 6min (slippage risk)
   maxHoursToSettle: 1.0,  // only enter within 1h of settlement (tight timing window)
-  exitAfterSettleMins: 15, // auto-exit this many minutes after settlement
+  exitAfterSettleMins: 3,  // exit 3min after settlement — no yield left, pure directional risk
   trendFilter:      true,  // skip if price trend opposes entry direction
   maxVolatilityPct: 5,     // skip if 1h range > 5% (0 = disabled)
   scanIntervalMs:   60 * 1000, // 1 min — entry scan (funding rates don't change intra-period)
@@ -70,12 +70,14 @@ await hl.ensureMeta()
 const log = (...a) => console.log(`[${new Date().toISOString()}]`, ...a)
 
 // ── RUNTIME STATE ─────────────────────────────────────────────────────────────
-let paused       = false
-let scanning     = false
-let scanTimer    = null
-let lastRates    = {}   // { asset: { apr, volume24h, ts } }
-let lastMidPrices = {} // { asset: price } updated during scan
-let cachedBal    = null // last fetched balance
+let paused            = false
+let scanning          = false
+let scanTimer         = null
+let lastRates         = {}      // { asset: { apr, volume24h, ts } }
+let lastMidPrices     = {}      // { asset: price } updated during scan
+let cachedBal         = null    // last fetched balance
+let btcFundingRegime  = 'neutral'  // 'crowded_long' | 'neutral' — updated each scan
+let crowdedLongRatio  = 0.5        // % of liquid assets with positive funding
 
 // ── PERSISTENT STATE ──────────────────────────────────────────────────────────
 function loadState() {
@@ -247,6 +249,15 @@ async function scan() {
   for (const r of allRates) lastRates[r.asset] = { apr: r.apr, volume24h: r.volume24h, ts: now }
   log(`Loaded ${allRates.length} assets`)
 
+  // Detect funding regime: if ≥65% of liquid assets have positive funding → market crowded long
+  // Going LONG (negative funding) in crowded-long market = fighting macro + no yield edge
+  const liquidRates = allRates.filter(r => r.volume24h >= 5_000_000)
+  crowdedLongRatio  = liquidRates.length > 0
+    ? liquidRates.filter(r => r.apr > 0).length / liquidRates.length
+    : 0.5
+  btcFundingRegime = crowdedLongRatio >= 0.65 ? 'crowded_long' : 'neutral'
+  log(`Funding regime: ${btcFundingRegime} | ${(crowdedLongRatio * 100).toFixed(0)}% of ${liquidRates.length} liquid assets have positive funding`)
+
   // Scan for new entries
   const openCount = Object.keys(state.positions).length
   const hoursLeft = hoursUntilNextSettlement()
@@ -268,6 +279,15 @@ async function scan() {
     for (const opp of opps) {
       if (Object.keys(state.positions).length >= CFG.maxPositions) break
       const isBuy  = opp.apr < 0
+
+      // Regime gate: in crowded-long market, skip going LONG on alts
+      // Most assets have positive funding = everyone is long = macro trend is BTC not alts
+      // Going long alt (negative funding) = fighting macro + collecting tiny yield = bad risk/reward
+      if (isBuy && btcFundingRegime === 'crowded_long') {
+        log(`SKIP ${opp.asset} LONG — regime block: ${(crowdedLongRatio*100).toFixed(0)}% crowded long market, alt longs high risk`)
+        continue
+      }
+
       const filter = await passesEntryFilters(opp.asset, isBuy, Math.abs(opp.apr))
       if (!filter.ok) { log(`SKIP ${opp.asset} — ${filter.reason}`); continue }
       const result = await openPosition(opp.asset, isBuy, opp.apr)
@@ -343,9 +363,19 @@ async function liveRefresh() {
         if (dropFromPeak >= trailPct)
           exitReason = `trailing-stop ${dropFromPeak.toFixed(2)}% from peak`
       }
+      // Funding deterioration — exit early when yield thesis collapses
+      // If current APR has dropped below 40% of entry APR before settlement, the reason to hold is gone
+      if (!exitReason && pos.settlesAt > now && pos.fundingAPR !== 0 && lastRates[asset]) {
+        const currentApr = Math.abs(lastRates[asset].apr)
+        const entryApr   = Math.abs(pos.fundingAPR)
+        if (entryApr >= CFG.minFundingApr && currentApr < entryApr * 0.40) {
+          exitReason = `funding-collapse: APR ${entryApr.toFixed(0)}% → ${currentApr.toFixed(0)}% (yield gone, pure directional risk now)`
+        }
+      }
+
       if (!exitReason && pos.settlesAt) {
         const minsAfterSettle = (now - pos.settlesAt) / 60000
-        const exitMins = CFG.exitAfterSettleMins ?? 15
+        const exitMins = CFG.exitAfterSettleMins ?? 3
         if (minsAfterSettle >= exitMins)
           exitReason = `post-settlement exit (+${minsAfterSettle.toFixed(0)}min after funding)`
       }
