@@ -28,12 +28,12 @@ let CFG = {
   maxPositionUsd:       60,   // max size when APR >= highAprThreshold
   maxHoldHours:     8,
   minFundingApr:    60,       // raised: 30%+ too marginal, focus on 60%+ quality yield
-  minHoursToSettle: 0.1,  // don't enter in last 6min (slippage risk)
-  maxHoursToSettle: 1.0,  // only enter within 1h of settlement (tight timing window)
-  exitAfterSettleMins: 3,  // exit 3min after settlement — no yield left, pure directional risk
+  minHoursToSettle: 0.1,  // don't enter in last 6min before hourly funding tick (slippage risk)
+  maxHoursToSettle: 1.0,  // hourly funding — 1.0 effectively means "any time in the hour"
+  exitAfterSettleMins: 3,  // exit 3min after settlement — funding collected, pure directional risk after
   trendFilter:      true,  // skip if price trend opposes entry direction
   maxVolatilityPct: 5,     // skip if 1h range > 5% (0 = disabled)
-  scanIntervalMs:   60 * 1000, // 1 min — entry scan (funding rates don't change intra-period)
+  scanIntervalMs:   60 * 1000, // 1 min — entry scan
   liveRefreshMs:    5 * 1000,  // 5s — SL + price monitoring
   priceChangePct:   1.0,   // emergency exit if price moves this % in one tick (0 = disabled)
 }
@@ -92,9 +92,18 @@ function loadState() {
 }
 function saveState(s) { writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)) }
 
+// Serialize all state load+mutate+save sequences across scan() and liveRefresh()
+// so concurrent awaits can't lose each other's writes.
+let _stateLock = Promise.resolve()
+function lockState(fn) {
+  const prev = _stateLock
+  let release
+  _stateLock = new Promise(r => { release = r })
+  return prev.then(() => fn()).finally(() => release())
+}
+
 async function syncPositionsFromHL() {
   try {
-    const state = loadState()
     let hlPositions = []
     try {
       const cs = await hl.info.clearinghouseState({ user: identity.hl.address })
@@ -103,41 +112,41 @@ async function syncPositionsFromHL() {
       const acc = await hl.getAccountState(identity.hl.address)
       hlPositions = acc?.assetPositions ?? acc?.positions ?? []
     }
-    let synced = 0
-    for (const ap of hlPositions) {
-      const pos = ap?.position ?? ap
-      if (!pos) continue
-      const asset = pos.coin ?? pos.asset
-      const szi = parseFloat(pos.szi ?? pos.size ?? '0')
-      if (!asset || Math.abs(szi) < 0.0001 || EXCLUDED.has(asset)) continue
-      if (!state.positions[asset]) {
-        const isBuy = szi > 0
-        const entryPx = parseFloat(pos.entryPx ?? pos.entryPrice ?? '0')
-        const now = Date.now()
-        state.positions[asset] = {
-          isBuy, entryPrice: entryPx, openedAt: now,
-          fundingAPR: 0, sizeUsd: Math.abs(szi) * entryPx,
-          settlesAt: now + hoursUntilNextSettlement() * 3600000,
+    await lockState(async () => {
+      const state = loadState()
+      let synced = 0
+      for (const ap of hlPositions) {
+        const pos = ap?.position ?? ap
+        if (!pos) continue
+        const asset = pos.coin ?? pos.asset
+        const szi = parseFloat(pos.szi ?? pos.size ?? '0')
+        if (!asset || Math.abs(szi) < 0.0001 || EXCLUDED.has(asset)) continue
+        if (!state.positions[asset]) {
+          const isBuy = szi > 0
+          const entryPx = parseFloat(pos.entryPx ?? pos.entryPrice ?? '0')
+          const now = Date.now()
+          state.positions[asset] = {
+            isBuy, entryPrice: entryPx, openedAt: now,
+            fundingAPR: 0, sizeUsd: Math.abs(szi) * entryPx,
+            settlesAt: now + hoursUntilNextSettlement() * 3600000,
+            peakPrice: entryPx,
+          }
+          synced++
+          log(`[sync] Recovered ${isBuy?'LONG':'SHORT'} ${asset} @ ${entryPx} from Hyperliquid`)
         }
-        synced++
-        log(`[sync] Recovered ${isBuy?'LONG':'SHORT'} ${asset} @ ${entryPx} from Hyperliquid`)
       }
-    }
-    if (synced > 0) saveState(state)
-    log(`[sync] ${hlPositions.length} HL positions checked, ${synced} recovered`)
+      if (synced > 0) saveState(state)
+      log(`[sync] ${hlPositions.length} HL positions checked, ${synced} recovered`)
+    })
   } catch (e) { log('[sync] Error:', e.message) }
 }
 
-// Funding settles at 00:00, 08:00, 16:00 UTC every day
+// Hyperliquid pays funding every hour on the hour (UTC)
 function hoursUntilNextSettlement() {
   const now = new Date()
-  const h = now.getUTCHours(), m = now.getUTCMinutes(), s = now.getUTCSeconds()
-  const minuteOfDay = h * 60 + m + s / 60
-  const settlements = [0, 8 * 60, 16 * 60, 24 * 60]
-  for (const t of settlements) {
-    if (t > minuteOfDay) return (t - minuteOfDay) / 60
-  }
-  return 0
+  const m = now.getUTCMinutes(), s = now.getUTCSeconds(), ms = now.getUTCMilliseconds()
+  const minutesIntoHour = m + s / 60 + ms / 60000
+  return (60 - minutesIntoHour) / 60
 }
 
 // Excluded assets — never trade these
@@ -187,7 +196,7 @@ async function passesEntryFilters(asset, isBuy, aprAbs = 0) {
     }
 
     return { ok: true, reason: 'passed' }
-  } catch { return { ok: true, reason: 'filter error — allowed' } }
+  } catch (e) { return { ok: false, reason: `filter error — skipped: ${e.message}` } }
 }
 
 // ── POSITION MANAGEMENT ───────────────────────────────────────────────────────
@@ -281,8 +290,6 @@ async function scan() {
       const isBuy  = opp.apr < 0
 
       // Regime gate: in crowded-long market, skip going LONG on alts
-      // Most assets have positive funding = everyone is long = macro trend is BTC not alts
-      // Going long alt (negative funding) = fighting macro + collecting tiny yield = bad risk/reward
       if (isBuy && btcFundingRegime === 'crowded_long') {
         log(`SKIP ${opp.asset} LONG — regime block: ${(crowdedLongRatio*100).toFixed(0)}% crowded long market, alt longs high risk`)
         continue
@@ -291,16 +298,28 @@ async function scan() {
       const filter = await passesEntryFilters(opp.asset, isBuy, Math.abs(opp.apr))
       if (!filter.ok) { log(`SKIP ${opp.asset} — ${filter.reason}`); continue }
       const result = await openPosition(opp.asset, isBuy, opp.apr)
+      const tNow = Date.now()
       if (!result || result.failed) {
-        // Cool down failed asset for 30 min to prevent retry spam on fast scan
-        state.cooldowns[opp.asset] = now + 30 * 60 * 1000
-        saveState(state)
+        await lockState(async () => {
+          const s = loadState()
+          s.cooldowns[opp.asset] = tNow + 30 * 60 * 1000
+          saveState(s)
+        })
         continue
       }
       const mid = await hl.getMidPrice(opp.asset)
-      const settlesAt = now + hoursLeft * 3600000
-      state.positions[opp.asset] = { isBuy, entryPrice: parseFloat(result?.filled?.avgPx ?? result?.avgPrice ?? 0) || mid, openedAt: now, fundingAPR: opp.apr, sizeUsd: result.sizeUsd ?? CFG.positionUsd, settlesAt }
-      saveState(state)
+      const settlesAt = tNow + hoursUntilNextSettlement() * 3600000
+      const entryPrice = parseFloat(result?.filled?.avgPx ?? result?.avgPrice ?? 0) || mid
+      await lockState(async () => {
+        const s = loadState()
+        s.positions[opp.asset] = {
+          isBuy, entryPrice, openedAt: tNow, fundingAPR: opp.apr,
+          sizeUsd: result.sizeUsd ?? CFG.positionUsd, settlesAt,
+          peakPrice: entryPrice,
+        }
+        saveState(s)
+        state.positions[opp.asset] = s.positions[opp.asset]  // keep loop view in sync
+      })
     }
     } // end else (enough time to settle)
   }
@@ -321,6 +340,7 @@ function scheduleScan() {
 // NOTE: intentionally NOT gated on `scanning` — stop losses must fire even during a slow scan
 async function liveRefresh() {
   try {
+    await lockState(async () => {
     const state = loadState()
     const now   = Date.now()
     let changed = false
@@ -363,13 +383,17 @@ async function liveRefresh() {
         if (dropFromPeak >= trailPct)
           exitReason = `trailing-stop ${dropFromPeak.toFixed(2)}% from peak`
       }
-      // Funding deterioration — exit early when yield thesis collapses
-      // If current APR has dropped below 40% of entry APR before settlement, the reason to hold is gone
+      // Funding deterioration — exit early when yield thesis collapses or flips against us
       if (!exitReason && pos.settlesAt > now && pos.fundingAPR !== 0 && lastRates[asset]) {
-        const currentApr = Math.abs(lastRates[asset].apr)
-        const entryApr   = Math.abs(pos.fundingAPR)
-        if (entryApr >= CFG.minFundingApr && currentApr < entryApr * 0.40) {
-          exitReason = `funding-collapse: APR ${entryApr.toFixed(0)}% → ${currentApr.toFixed(0)}% (yield gone, pure directional risk now)`
+        const currentAprSigned = lastRates[asset].apr
+        const entryAprSigned   = pos.fundingAPR
+        const entryAbs   = Math.abs(entryAprSigned)
+        const currentAbs = Math.abs(currentAprSigned)
+        const flipped    = Math.sign(currentAprSigned) !== Math.sign(entryAprSigned) && currentAbs > 5
+        if (entryAbs >= CFG.minFundingApr && flipped) {
+          exitReason = `funding-flip: APR ${entryAprSigned.toFixed(0)}% → ${currentAprSigned.toFixed(0)}% (now paying against us)`
+        } else if (entryAbs >= CFG.minFundingApr && currentAbs < entryAbs * 0.40) {
+          exitReason = `funding-collapse: APR ${entryAbs.toFixed(0)}% → ${currentAbs.toFixed(0)}% (yield gone, pure directional risk now)`
         }
       }
 
@@ -397,9 +421,14 @@ async function liveRefresh() {
     if (changed) saveState(state)
     if (Object.keys(state.positions).length > 0)
       cachedBal = await hl.getAccountState(identity.hl.address).catch(() => cachedBal)
+    })
   } catch (e) { log('liveRefresh error:', e.message) }
 }
-setInterval(liveRefresh, CFG.liveRefreshMs ?? 5000)
+
+// Self-scheduling so config changes to liveRefreshMs take effect without restart
+function scheduleLiveRefresh() {
+  setTimeout(async () => { await liveRefresh(); scheduleLiveRefresh() }, CFG.liveRefreshMs ?? 5000)
+}
 
 // ── API HANDLERS ──────────────────────────────────────────────────────────────
 function apiStatus() {
@@ -434,18 +463,22 @@ function apiStatus() {
 }
 
 async function apiClose(asset) {
-  const state = loadState()
-  if (!state.positions[asset]) return { error: 'Position not found' }
-  const pos       = state.positions[asset]
+  const pre = loadState()
+  if (!pre.positions[asset]) return { error: 'Position not found' }
+  const pos       = pre.positions[asset]
   const mid       = await hl.getMidPrice(asset).catch(() => null)
   const exitPrice = await closePosition(asset, 'manual close from dashboard') ?? mid
   const pricePct  = exitPrice ? ((exitPrice - pos.entryPrice) / pos.entryPrice) * 100 : null
   const pnlUsd    = pricePct !== null ? (pricePct / 100) * (pos.sizeUsd ?? CFG.positionUsd) * (pos.isBuy ? 1 : -1) : null
-  state.history.unshift({ asset, side: pos.isBuy ? 'LONG' : 'SHORT', entryPrice: pos.entryPrice,
-    exitPrice, fundingAPR: pos.fundingAPR, openedAt: pos.openedAt, closedAt: Date.now(),
-    reason: 'manual', pnlUsd })
-  delete state.positions[asset]
-  saveState(state)
+  await lockState(async () => {
+    const state = loadState()
+    if (!state.positions[asset]) return
+    state.history.unshift({ asset, side: pos.isBuy ? 'LONG' : 'SHORT', entryPrice: pos.entryPrice,
+      exitPrice, fundingAPR: pos.fundingAPR, openedAt: pos.openedAt, closedAt: Date.now(),
+      reason: 'manual', pnlUsd })
+    delete state.positions[asset]
+    saveState(state)
+  })
   return { ok: true, exitPrice, pnlUsd }
 }
 
@@ -1245,3 +1278,4 @@ log(`$${CFG.positionUsd}/pos | ${CFG.leverage}x | SL ${CFG.stopLossPct}% | max $
 await syncPositionsFromHL()
 await scan()
 scheduleScan()
+scheduleLiveRefresh()
