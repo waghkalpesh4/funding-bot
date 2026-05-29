@@ -26,6 +26,10 @@ let CFG = {
   trailingStopHighApr:  5.0,  // trail % for high-APR positions
   dynamicSizing:        true, // scale position size with APR
   maxPositionUsd:       60,   // max size when APR >= highAprThreshold
+  maxSettlements:           1,  // hourly settlements to collect before exiting (1 = current behaviour)
+  highAprMaxSettlements:    3,  // settlements for positions with APR >= highAprThreshold
+  aprTrendFilter:        true,  // skip entry if APR has fallen >20% from its 6-scan peak
+  regimeFlipCooldownMins:  10,  // mins to wait after crowded_long→neutral before allowing LONGs
   maxHoldHours:     8,
   minFundingApr:    60,       // raised: 30%+ too marginal, focus on 60%+ quality yield
   minHoursToSettle: 0.1,  // don't enter in last 6min before hourly funding tick (slippage risk)
@@ -78,6 +82,9 @@ let lastMidPrices     = {}      // { asset: price } updated during scan
 let cachedBal         = null    // last fetched balance
 let btcFundingRegime  = 'neutral'  // 'crowded_long' | 'neutral' — updated each scan
 let crowdedLongRatio  = 0.5        // % of liquid assets with positive funding
+let prevRegime        = 'neutral'  // previous regime value for flip detection
+let regimeFlipTime    = 0          // timestamp when regime last flipped crowded_long → neutral
+let rateHistory       = {}         // { asset: [{apr, ts}] } — rolling 6-scan window
 
 // ── PERSISTENT STATE ──────────────────────────────────────────────────────────
 function loadState() {
@@ -255,7 +262,12 @@ async function scan() {
   // Bulk fetch all funding rates (single API call)
   log('Fetching all funding rates...')
   const allRates = await getAllFundingRates()
-  for (const r of allRates) lastRates[r.asset] = { apr: r.apr, volume24h: r.volume24h, ts: now }
+  for (const r of allRates) {
+    lastRates[r.asset] = { apr: r.apr, volume24h: r.volume24h, ts: now }
+    if (!rateHistory[r.asset]) rateHistory[r.asset] = []
+    rateHistory[r.asset].push({ apr: r.apr, ts: now })
+    if (rateHistory[r.asset].length > 6) rateHistory[r.asset].shift()
+  }
   log(`Loaded ${allRates.length} assets`)
 
   // Detect funding regime: if ≥65% of liquid assets have positive funding → market crowded long
@@ -265,6 +277,11 @@ async function scan() {
     ? liquidRates.filter(r => r.apr > 0).length / liquidRates.length
     : 0.5
   btcFundingRegime = crowdedLongRatio >= 0.65 ? 'crowded_long' : 'neutral'
+  if (prevRegime === 'crowded_long' && btcFundingRegime === 'neutral') {
+    regimeFlipTime = now
+    log(`Regime flipped crowded_long → neutral — ${CFG.regimeFlipCooldownMins ?? 10}min LONG cooldown starts now`)
+  }
+  prevRegime = btcFundingRegime
   log(`Funding regime: ${btcFundingRegime} | ${(crowdedLongRatio * 100).toFixed(0)}% of ${liquidRates.length} liquid assets have positive funding`)
 
   // Scan for new entries
@@ -295,6 +312,29 @@ async function scan() {
         continue
       }
 
+      // Regime flip cooldown: wait N mins after crowded_long→neutral before LONGs
+      const regimeCooldownMs = (CFG.regimeFlipCooldownMins ?? 10) * 60000
+      if (isBuy && regimeFlipTime > 0 && (now - regimeFlipTime) < regimeCooldownMs) {
+        const minsLeft = ((regimeCooldownMs - (now - regimeFlipTime)) / 60000).toFixed(1)
+        log(`SKIP ${opp.asset} LONG — regime flip cooldown: ${minsLeft}min remaining`)
+        continue
+      }
+
+      // APR trend gate: skip if rate has dropped >20% from its recent peak (yield collapsing pre-entry)
+      if (CFG.aprTrendFilter) {
+        const hist = rateHistory[opp.asset]
+        if (hist && hist.length >= 3) {
+          const absAprs = hist.map(h => Math.abs(h.apr))
+          const peak    = Math.max(...absAprs)
+          const latest  = absAprs[absAprs.length - 1]
+          const pctOff  = peak > 0 ? (peak - latest) / peak * 100 : 0
+          if (pctOff > 20) {
+            log(`SKIP ${opp.asset} — APR trend falling: ${peak.toFixed(0)}% peak → ${latest.toFixed(0)}% now (${pctOff.toFixed(0)}% off peak)`)
+            continue
+          }
+        }
+      }
+
       const filter = await passesEntryFilters(opp.asset, isBuy, Math.abs(opp.apr))
       if (!filter.ok) { log(`SKIP ${opp.asset} — ${filter.reason}`); continue }
       const result = await openPosition(opp.asset, isBuy, opp.apr)
@@ -315,7 +355,7 @@ async function scan() {
         s.positions[opp.asset] = {
           isBuy, entryPrice, openedAt: tNow, fundingAPR: opp.apr,
           sizeUsd: result.sizeUsd ?? CFG.positionUsd, settlesAt,
-          peakPrice: entryPrice,
+          peakPrice: entryPrice, settlementsCollected: 0,
         }
         saveState(s)
         state.positions[opp.asset] = s.positions[opp.asset]  // keep loop view in sync
@@ -400,8 +440,19 @@ async function liveRefresh() {
       if (!exitReason && pos.settlesAt) {
         const minsAfterSettle = (now - pos.settlesAt) / 60000
         const exitMins = CFG.exitAfterSettleMins ?? 3
-        if (minsAfterSettle >= exitMins)
-          exitReason = `post-settlement exit (+${minsAfterSettle.toFixed(0)}min after funding)`
+        if (minsAfterSettle >= exitMins) {
+          const isHighApr  = Math.abs(pos.fundingAPR) >= (CFG.highAprThreshold ?? 300)
+          const maxSettles = isHighApr ? (CFG.highAprMaxSettlements ?? 3) : (CFG.maxSettlements ?? 1)
+          const collected  = (pos.settlementsCollected ?? 0) + 1
+          if (collected >= maxSettles) {
+            exitReason = `post-settlement exit (${collected}/${maxSettles} settlements collected)`
+          } else {
+            pos.settlementsCollected = collected
+            pos.settlesAt = now + hoursUntilNextSettlement() * 3600000
+            changed = true
+            log(`[${asset}] Settlement ${collected}/${maxSettles} collected — holding for next in ${(hoursUntilNextSettlement()*60).toFixed(0)}min`)
+          }
+        }
       }
       if (!exitReason && heldHours >= CFG.maxHoldHours)
         exitReason = `max hold ${heldHours.toFixed(1)}h`
@@ -651,6 +702,10 @@ tr:hover .red{text-shadow:0 0 8px rgba(255,45,85,0.4)}
       <div class="cfg-field"><label>Trail % (High APR)</label><input id="cfgTSHigh" type="number" step="0.5"></div>
       <div class="cfg-field"><label>Max Hold Hrs</label><input id="cfgHold" type="number" step="1"></div>
       <div class="cfg-field"><label>Max Positions</label><input id="cfgMaxPos" type="number" step="1"></div>
+      <div class="cfg-field"><label>Max Settlements</label><input id="cfgMaxSettle2" type="number" step="1"></div>
+      <div class="cfg-field"><label>Max Settlements (High APR)</label><input id="cfgMaxSettleHigh" type="number" step="1"></div>
+      <div class="cfg-field"><label>APR Trend Filter</label><select id="cfgAprTrend" style="background:#0a0a0a;border:1px solid #2a2a2a;color:#d4d4d4;padding:5px 8px;border-radius:4px;font-size:12px"><option value="true">On</option><option value="false">Off</option></select></div>
+      <div class="cfg-field"><label>Regime Flip Cooldown (min)</label><input id="cfgRegimeCooldown" type="number" step="1"></div>
       <button class="btn btn-save" onclick="saveConfig()">Save</button>
     </div>
   </div>
@@ -1081,10 +1136,14 @@ async function refresh() {
     document.getElementById('cfgDynSize').value     = d.cfg.dynamicSizing ? 'true' : 'false'
     document.getElementById('cfgSL').value     = d.cfg.stopLossPct
     document.getElementById('cfgTS').value         = d.cfg.trailingStopPct
-    document.getElementById('cfgHighAprThr').value  = d.cfg.highAprThreshold ?? 300
-    document.getElementById('cfgTSHigh').value      = d.cfg.trailingStopHighApr ?? 5
-    document.getElementById('cfgHold').value        = d.cfg.maxHoldHours
-    document.getElementById('cfgMaxPos').value = d.cfg.maxPositions
+    document.getElementById('cfgHighAprThr').value     = d.cfg.highAprThreshold ?? 300
+    document.getElementById('cfgTSHigh').value         = d.cfg.trailingStopHighApr ?? 5
+    document.getElementById('cfgHold').value           = d.cfg.maxHoldHours
+    document.getElementById('cfgMaxPos').value         = d.cfg.maxPositions
+    document.getElementById('cfgMaxSettle2').value     = d.cfg.maxSettlements ?? 1
+    document.getElementById('cfgMaxSettleHigh').value  = d.cfg.highAprMaxSettlements ?? 3
+    document.getElementById('cfgAprTrend').value       = d.cfg.aprTrendFilter ? 'true' : 'false'
+    document.getElementById('cfgRegimeCooldown').value = d.cfg.regimeFlipCooldownMins ?? 10
 
     // Positions
     const ptb = document.getElementById('posTbody')
@@ -1181,8 +1240,12 @@ async function saveConfig() {
     trailingStopPct:        parseFloat(document.getElementById('cfgTS').value),
     highAprThreshold:       parseFloat(document.getElementById('cfgHighAprThr').value),
     trailingStopHighApr:    parseFloat(document.getElementById('cfgTSHigh').value),
-    maxHoldHours:           parseFloat(document.getElementById('cfgHold').value),
-    maxPositions:    parseInt(document.getElementById('cfgMaxPos').value),
+    maxHoldHours:             parseFloat(document.getElementById('cfgHold').value),
+    maxPositions:             parseInt(document.getElementById('cfgMaxPos').value),
+    maxSettlements:           parseInt(document.getElementById('cfgMaxSettle2').value),
+    highAprMaxSettlements:    parseInt(document.getElementById('cfgMaxSettleHigh').value),
+    aprTrendFilter:           document.getElementById('cfgAprTrend').value === 'true',
+    regimeFlipCooldownMins:   parseFloat(document.getElementById('cfgRegimeCooldown').value),
   }
   await fetch('/api/config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) })
   document.getElementById('cfgPanel').classList.remove('open')
