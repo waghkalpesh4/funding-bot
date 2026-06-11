@@ -548,7 +548,8 @@ function apiStatus() {
     const pnlUsd     = pricePct !== null ? (pricePct / 100) * (pos.sizeUsd ?? CFG.positionUsd) * (pos.isBuy ? 1 : -1) : null
     return { asset, side: pos.isBuy ? 'LONG' : 'SHORT', entryPrice: pos.entryPrice,
       midPrice: mid, fundingAPR: pos.fundingAPR, heldHours: (Date.now() - pos.openedAt) / 3600000,
-      adversePct, pnlUsd, openedAt: pos.openedAt }
+      adversePct, pnlUsd, openedAt: pos.openedAt,
+      settlesAt: pos.settlesAt ?? null, settlementsCollected: pos.settlementsCollected ?? 0 }
   })
 
   const rates = Object.entries(lastRates)
@@ -857,6 +858,50 @@ tbody tr:hover{background:rgba(255,180,84,0.035)}
 .chart-box{padding:14px 16px;position:relative;height:280px}
 #pnlEmpty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--faint);font-size:12px}
 
+/* ── TICKER TAPE ────────────────────────────────────── */
+.tape{overflow:hidden;border-bottom:1px solid var(--line);background:rgba(19,16,10,0.7);height:30px;display:flex;align-items:center}
+.tape-track{display:inline-flex;white-space:nowrap;animation:tape 55s linear infinite;will-change:transform}
+.tape:hover .tape-track{animation-play-state:paused}
+@keyframes tape{to{transform:translateX(-50%)}}
+.tape-item{display:inline-flex;align-items:center;gap:7px;padding:0 18px;font-size:10.5px;letter-spacing:0.04em;color:var(--muted);border-right:1px solid var(--line)}
+.tape-item b{color:var(--ink);font-weight:600}
+
+/* ── BRAND SUB ──────────────────────────────────────── */
+.brand-blk{display:flex;flex-direction:column;line-height:1.15}
+.brand-sub{font-size:8.5px;letter-spacing:0.16em;color:var(--faint);text-transform:uppercase}
+
+/* ── DIVERGING APR BAR ──────────────────────────────── */
+.div-bar{position:relative;display:inline-block;width:90px;height:5px;background:var(--line);border-radius:2px;vertical-align:middle;flex-shrink:0}
+.div-bar::before{content:'';position:absolute;left:50%;top:-2px;bottom:-2px;width:1px;background:var(--line2)}
+.div-fill{position:absolute;top:0;bottom:0;border-radius:2px}
+
+/* ── SCANNER TABS ───────────────────────────────────── */
+.tabs{display:flex;gap:4px;margin-left:8px}
+.tab{font-family:'IBM Plex Mono',monospace;font-size:9.5px;font-weight:600;letter-spacing:0.08em;padding:2px 9px;border-radius:3px;border:1px solid transparent;background:transparent;color:var(--faint);cursor:pointer;min-height:20px;transition:color 0.12s,border-color 0.12s}
+.tab:hover{color:var(--muted)}
+.tab.active{color:var(--amber);border-color:var(--amber-line);background:var(--amber-soft)}
+
+/* ── SEARCH ─────────────────────────────────────────── */
+.search{font-family:'IBM Plex Mono',monospace;font-size:11px;background:var(--bg);border:1px solid var(--line2);color:var(--ink);padding:4px 10px;border-radius:3px;width:140px;margin-left:auto}
+.search:focus{border-color:var(--amber-line);outline:none}
+.search::placeholder{color:var(--faint)}
+
+/* ── FRESH ROW STAGGER ──────────────────────────────── */
+tbody.fresh tr{animation:rowin 0.3s ease-out backwards;animation-delay:calc(var(--i,0)*28ms)}
+@keyframes rowin{from{opacity:0;transform:translateY(4px)}}
+
+/* ── BUTTON POLISH ──────────────────────────────────── */
+.btn.primary{background:var(--amber-soft);border-color:var(--amber-line);color:var(--amber)}
+.btn.primary:hover{background:rgba(255,180,84,0.22)}
+.btn:active{transform:translateY(1px)}
+
+/* ── EQUITY MINI SPARK ──────────────────────────────── */
+.cell .mini{display:block;margin-top:5px;height:14px}
+
+/* ── POSITION SETTLE CHIP ───────────────────────────── */
+.settle-in{font-size:9px;color:var(--faint);margin-top:2px;letter-spacing:0.05em}
+.settle-in.hot{color:var(--amber)}
+
 @media (prefers-reduced-motion:reduce){
   *,*::before,*::after{animation:none !important;transition:none !important}
 }
@@ -865,12 +910,17 @@ tbody tr:hover{background:rgba(255,180,84,0.035)}
 <body>
 
 <header class="top">
-  <div class="brand">FUNDING<em>BOT</em></div>
+  <div class="brand-blk">
+    <div class="brand">FUNDING<em>BOT</em></div>
+    <div class="brand-sub">hyperliquid funding harvester</div>
+  </div>
   <span class="chip live" id="modeBadge"><span class="dot"></span>LIVE</span>
   <span class="chip paused" id="pauseBadge" style="display:none">PAUSED</span>
   <span class="chip regime-neutral" id="regimeChip" style="display:none"></span>
   <span class="updated" id="ts">connecting…</span>
 </header>
+
+<div class="tape" aria-hidden="true"><div class="tape-track" id="tapeTrack"></div></div>
 
 <div class="wrap">
 
@@ -879,7 +929,7 @@ tbody tr:hover{background:rgba(255,180,84,0.035)}
 
     <!-- Instrument strip -->
     <div class="strip" role="group" aria-label="Account metrics">
-      <div class="cell"><div class="lbl">Equity</div><div class="val" id="equity">—</div></div>
+      <div class="cell"><div class="lbl">Equity</div><div class="val" id="equity">—</div><span class="mini" id="eqSpark"></span></div>
       <div class="cell"><div class="lbl">Available</div><div class="val" id="avail">—</div></div>
       <div class="cell"><div class="lbl">Open P&amp;L</div><div class="val" id="openPnl">—</div></div>
       <div class="cell">
@@ -906,6 +956,12 @@ tbody tr:hover{background:rgba(255,180,84,0.035)}
       <div class="panel-head">
         <h2>Scanner</h2>
         <span class="meta" id="scannerSummary"></span>
+        <span class="tabs" role="tablist" aria-label="Scanner filter">
+          <button class="tab active" data-filter="all">ALL</button>
+          <button class="tab" data-filter="enter">ENTERED</button>
+          <button class="tab" data-filter="skip">SKIPPED</button>
+          <button class="tab" data-filter="hold">HELD</button>
+        </span>
         <span class="right" id="scannerTs">waiting for first scan…</span>
       </div>
       <div class="sweep" id="scanSweep"></div>
@@ -932,7 +988,7 @@ tbody tr:hover{background:rgba(255,180,84,0.035)}
 
     <!-- Funding Rates -->
     <div class="panel">
-      <div class="panel-head"><h2>Funding Rates</h2><span class="count-tag" id="rateCount" style="display:none"></span></div>
+      <div class="panel-head"><h2>Funding Rates</h2><span class="count-tag" id="rateCount" style="display:none"></span><input class="search" id="rateSearch" type="search" placeholder="filter asset…" aria-label="Filter assets"></div>
       <div style="overflow-x:auto">
       <table>
         <thead><tr><th>Asset</th><th>APR</th><th>Direction</th><th>Vol 24h</th><th>Signal</th></tr></thead>
@@ -985,7 +1041,7 @@ tbody tr:hover{background:rgba(255,180,84,0.035)}
     <div class="panel">
       <div class="panel-head"><h2>Controls</h2><span class="right" id="scanStatus"></span></div>
       <div class="controls">
-        <button class="btn" onclick="triggerScan()">SCAN NOW</button>
+        <button class="btn primary" onclick="triggerScan()">SCAN NOW</button>
         <button class="btn warn" id="pauseBtn" onclick="togglePause()">PAUSE BOT</button>
         <button class="btn" onclick="toggleCfg()" aria-expanded="false" id="cfgToggle">CONFIG</button>
       </div>
@@ -1039,18 +1095,51 @@ function fmtDate(ts){ return ts ? new Date(ts).toLocaleString() : '—' }
 function pnlClass(n){ return n>0?'green':n<0?'red':'' }
 function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') }
 
-// value flash on change
-function setVal(id, text, numeric, cls){
+// value flash + animated count on change
+var _lerps = {}
+function setVal(id, text, numeric, cls, fmtFn){
   var el = $(id); if(!el) return
   var prev = parseFloat(el.dataset.v)
-  el.textContent = text
   el.className = 'val' + (cls ? ' ' + cls : '')
-  if(numeric!=null && isFinite(prev) && Math.abs(numeric-prev) > 1e-9){
+  var changed = numeric!=null && isFinite(prev) && Math.abs(numeric-prev) > 1e-9
+  if(changed && fmtFn && !matchMedia('(prefers-reduced-motion: reduce)').matches){
+    if(_lerps[id]) cancelAnimationFrame(_lerps[id])
+    var t0 = performance.now(), dur = 450
+    ;(function step(now){
+      var t = Math.min(1, (now-t0)/dur)
+      var e = 1 - Math.pow(1-t, 3)
+      el.textContent = fmtFn(prev + (numeric-prev)*e)
+      if(t < 1) _lerps[id] = requestAnimationFrame(step)
+      else el.textContent = text
+    })(t0)
+  } else {
+    el.textContent = text
+  }
+  if(changed){
     el.classList.remove('flash-up','flash-down')
     void el.offsetWidth
     el.classList.add(numeric>prev ? 'flash-up' : 'flash-down')
   }
   el.dataset.v = numeric
+}
+
+// equity history sparkline (client-accumulated)
+var eqHist = []
+function eqPush(v){
+  if(v==null || !isFinite(v) || v<=0) return
+  if(eqHist.length && Math.abs(eqHist[eqHist.length-1]-v) < 1e-9) return
+  eqHist.push(v)
+  if(eqHist.length > 60) eqHist.shift()
+}
+function renderEqSpark(){
+  var el = $('eqSpark'); if(!el) return
+  if(eqHist.length < 2){ el.innerHTML=''; return }
+  var min = Math.min.apply(null,eqHist), max = Math.max.apply(null,eqHist), rng = (max-min) || 1
+  var w = 110, h = 14, pts = []
+  for(var i=0;i<eqHist.length;i++){
+    pts.push((i/(eqHist.length-1)*w).toFixed(1)+','+(h-1.5-(eqHist[i]-min)/rng*(h-3)).toFixed(1))
+  }
+  el.innerHTML = '<svg width="110" height="14" viewBox="0 0 110 14" aria-hidden="true"><polyline fill="none" stroke="#FFB454" stroke-width="1.3" stroke-linejoin="round" opacity="0.8" points="'+pts.join(' ')+'"/></svg>'
 }
 
 // ── sparklines (client-side mid history per asset) ───
@@ -1077,22 +1166,65 @@ function sparkSvg(asset, up){
 
 // ── settlement dial ──────────────────────────────────
 var nextSettleMs = null
+var lastScanAtVal = null
 var CIRC = 327
+
+// clock tick marks around the dial (settlement marker at top, amber)
+;(function(){
+  var svg = document.querySelector('.dial-wrap svg')
+  if(!svg) return
+  var NS = 'http://www.w3.org/2000/svg'
+  for(var k=0;k<12;k++){
+    var a = k*Math.PI/6
+    var l = document.createElementNS(NS,'line')
+    l.setAttribute('x1', (60+57*Math.cos(a)).toFixed(2)); l.setAttribute('y1', (60+57*Math.sin(a)).toFixed(2))
+    l.setAttribute('x2', (60+59.5*Math.cos(a)).toFixed(2)); l.setAttribute('y2', (60+59.5*Math.sin(a)).toFixed(2))
+    l.setAttribute('stroke', k===0 ? '#FFB454' : '#3A301C')
+    l.setAttribute('stroke-width', k%3===0 ? '1.8' : '1')
+    svg.appendChild(l)
+  }
+})()
+
+function fmtAgo(ms){
+  var s = Math.floor(ms/1000)
+  if(s < 60) return s + 's ago'
+  return Math.floor(s/60) + 'm ' + (s%60) + 's ago'
+}
+
 setInterval(function(){
-  if(!nextSettleMs) return
-  var ms = nextSettleMs - Date.now()
-  if(ms <= 0){ nextSettleMs += 3600000; ms += 3600000 }
-  var m = Math.floor(ms/60000), s = Math.floor((ms%60000)/1000)
-  $('dialTime').textContent = String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0')
-  var frac = ms/3600000
-  var prog = $('dialProg')
-  prog.style.strokeDashoffset = (CIRC*(1-frac)).toFixed(1)
-  var minH = (cfg && cfg.minHoursToSettle) || 0.1
-  var blocked = frac < minH
-  prog.classList.toggle('danger', blocked)
-  var st = $('dialStatus')
-  st.className = 'dial-status ' + (blocked ? 'blocked' : 'ok')
-  $('dialStatusTxt').textContent = blocked ? 'ENTRY BLOCKED — SETTLES SOON' : 'ENTRIES OPEN'
+  var now = Date.now()
+  if(nextSettleMs){
+    var ms = nextSettleMs - now
+    if(ms <= 0){ nextSettleMs += 3600000; ms += 3600000 }
+    var m = Math.floor(ms/60000), s = Math.floor((ms%60000)/1000)
+    $('dialTime').textContent = String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0')
+    var frac = ms/3600000
+    var prog = $('dialProg')
+    prog.style.strokeDashoffset = (CIRC*(1-frac)).toFixed(1)
+    var minH = (cfg && cfg.minHoursToSettle) || 0.1
+    var blocked = frac < minH
+    prog.classList.toggle('danger', blocked)
+    $('dialTime').style.color = blocked ? '#F25C5C' : ''
+    var st = $('dialStatus')
+    st.className = 'dial-status ' + (blocked ? 'blocked' : 'ok')
+    $('dialStatusTxt').textContent = blocked ? 'ENTRY BLOCKED — SETTLES SOON' : 'ENTRIES OPEN'
+  }
+  // per-position settlement countdowns
+  document.querySelectorAll('.settle-in').forEach(function(el){
+    var t = parseFloat(el.dataset.settle)
+    if(!t){ el.textContent=''; return }
+    var left = t - now
+    if(left > 0){
+      var mm = Math.floor(left/60000), ss = Math.floor((left%60000)/1000)
+      el.textContent = 'settles ' + String(mm).padStart(2,'0') + ':' + String(ss).padStart(2,'0')
+      el.classList.toggle('hot', left < 300000)
+    } else {
+      el.textContent = 'collecting…'
+      el.classList.add('hot')
+    }
+  })
+  // relative scan age
+  if(lastScanAtVal) $('scannerTs').textContent = 'scanned ' + fmtAgo(now - lastScanAtVal)
 }, 500)
 
 // ── pagination ───────────────────────────────────────
@@ -1122,15 +1254,19 @@ function renderRatesPage(rates, page){
   var rows = []
   for(var i=0;i<slice.length;i++){
     var r = slice[i]
-    var absApr = Math.abs(r.apr), barW = Math.min(absApr/4, 58)
+    var absApr = Math.abs(r.apr)
     var hot = absApr >= (cfg.minFundingApr||60)
-    var col = hot ? (r.apr<0 ? '#46D68C' : '#F25C5C') : '#3A301C'
+    var col = hot ? (r.apr<0 ? '#46D68C' : '#F25C5C') : '#5C543F'
+    var barW = Math.min(44, absApr/300*44).toFixed(1)
+    var fillStyle = r.apr < 0
+      ? 'right:50%;width:'+barW+'px;background:'+col
+      : 'left:50%;width:'+barW+'px;background:'+col
     var aprStr = (r.apr>=0?'+':'') + r.apr.toFixed(1) + '%'
     var vol = r.volume24h>=1e6 ? '$'+(r.volume24h/1e6).toFixed(1)+'M' : '$'+(r.volume24h/1e3).toFixed(0)+'K'
     var dir = r.apr<0 ? '<span class="green">longs paid</span>' : '<span class="red">shorts paid</span>'
     var sig = hot ? (r.apr<0 ? '<span class="pill long">LONG</span>' : '<span class="pill short">SHORT</span>') : '<span class="dim">—</span>'
     rows.push('<tr><td><b>'+esc(r.asset)+'</b></td>'
-      + '<td><span class="apr-wrap"><span class="apr-bg"><span class="apr-fill" style="width:'+barW+'px;background:'+col+'"></span></span>'
+      + '<td><span class="apr-wrap"><span class="div-bar"><span class="div-fill" style="'+fillStyle+'"></span></span>'
       + '<span class="'+(r.apr<0?'green':'red')+'" style="font-size:11px">'+aprStr+'</span></span></td>'
       + '<td style="font-size:11px">'+dir+'</td>'
       + '<td class="dim" style="font-size:11px">'+vol+'</td>'
@@ -1273,6 +1409,58 @@ var DEC = {
   PENDING: {cls:'dec-dim',   label:'PENDING'}
 }
 
+// ── ticker tape ──────────────────────────────────────
+var tapeSig = ''
+function renderTape(rates){
+  var top = rates.slice(0, 18)
+  if(!top.length) return
+  var sig = top.map(function(r){ return r.asset + Math.round(r.apr) }).join('|')
+  if(sig === tapeSig) return
+  tapeSig = sig
+  var items = top.map(function(r){
+    var c = r.apr < 0 ? 'green' : 'red'
+    return '<span class="tape-item"><b>'+esc(r.asset)+'</b><span class="'+c+'">'+(r.apr>=0?'+':'')+r.apr.toFixed(1)+'%</span></span>'
+  }).join('')
+  $('tapeTrack').innerHTML = items + items
+}
+
+// ── scanner (filterable) ─────────────────────────────
+var scanCache = [], scanFilter = 'all', scanRenderedAt = null
+function matchesFilter(s){
+  if(scanFilter==='all') return true
+  if(scanFilter==='enter') return s.decision==='ENTER'
+  if(scanFilter==='hold') return s.decision==='HOLDING'
+  return s.decision!=='ENTER' && s.decision!=='HOLDING'
+}
+function renderScanner(animate){
+  var list = scanCache.filter(matchesFilter)
+  var tb = $('scannerTbody')
+  if(!scanCache.length){
+    tb.innerHTML = '<tr><td colspan="6" class="empty">Scan results appear after first scan</td></tr>'
+    return
+  }
+  if(!list.length){
+    tb.innerHTML = '<tr><td colspan="6" class="empty">No assets match this filter</td></tr>'
+    return
+  }
+  tb.innerHTML = list.map(function(s, i){
+    var aprStr = (s.apr>=0?'+':'') + s.apr.toFixed(1) + '%'
+    var side = s.isBuy ? '<span class="pill long">LONG</span>' : '<span class="pill short">SHORT</span>'
+    var vol = s.vol>=1e6 ? '$'+(s.vol/1e6).toFixed(1)+'M' : '$'+(s.vol/1e3).toFixed(0)+'K'
+    var dec = DEC[s.decision] || {cls:'dec-dim', label:s.decision}
+    return '<tr style="--i:'+i+'"><td><b>'+esc(s.asset)+'</b></td>'
+      + '<td>'+side+'</td>'
+      + '<td class="'+(s.apr<0?'green':'red')+'" style="font-size:11px">'+aprStr+'</td>'
+      + '<td class="dim" style="font-size:11px">'+vol+'</td>'
+      + '<td><span class="badge-dec '+dec.cls+'">'+dec.label+'</span></td>'
+      + '<td class="reason">'+esc(s.reason||'—')+'</td></tr>'
+  }).join('')
+  if(animate){
+    tb.classList.add('fresh')
+    setTimeout(function(){ tb.classList.remove('fresh') }, 900)
+  }
+}
+
 async function refresh(){
   try{
     var d = await fetch('/api/status').then(function(r){return r.json()})
@@ -1298,12 +1486,13 @@ async function refresh(){
     }
 
     // instrument strip
-    setVal('equity', '$'+fmt(d.equity), d.equity)
-    setVal('avail', '$'+fmt(d.avail), d.avail)
+    setVal('equity', '$'+fmt(d.equity), d.equity, '', function(v){return '$'+v.toFixed(2)})
+    setVal('avail', '$'+fmt(d.avail), d.avail, '', function(v){return '$'+v.toFixed(2)})
+    eqPush(d.equity); renderEqSpark()
     var openPnl = d.positions.reduce(function(s,p){return s+(p.pnlUsd||0)},0)
-    setVal('openPnl', fmtUsd(openPnl), openPnl, openPnl>0?'pos':openPnl<0?'neg':'')
+    setVal('openPnl', fmtUsd(openPnl), openPnl, openPnl>0?'pos':openPnl<0?'neg':'', fmtUsd)
     var closedPnl = d.totalClosedPnl != null ? d.totalClosedPnl : d.history.reduce(function(s,t){return s+(t.pnlUsd||0)},0)
-    setVal('closedPnl', fmtUsd(closedPnl), closedPnl, closedPnl>0?'pos':closedPnl<0?'neg':'')
+    setVal('closedPnl', fmtUsd(closedPnl), closedPnl, closedPnl>0?'pos':closedPnl<0?'neg':'', fmtUsd)
     var wins = d.totalWins||0, losses = d.totalLosses||0
     $('winCount').textContent = wins; $('lossCount').textContent = losses
     $('winRate').textContent = (wins+losses) ? Math.round(wins/(wins+losses)*100)+'%' : '—'
@@ -1368,7 +1557,7 @@ async function refresh(){
           + '<td>'+fmt(p.midPrice,4)+'</td>'
           + '<td>'+sparkSvg(p.asset, (p.pnlUsd||0) >= 0)+'</td>'
           + '<td class="'+(p.fundingAPR<0?'green':'red')+'">'+apr+'</td>'
-          + '<td>'+held+'</td>'
+          + '<td>'+held+'<div class="settle-in" data-settle="'+(p.settlesAt||'')+'"></div></td>'
           + '<td><span class="meter"><span class="meter-bg"><span class="meter-fill" style="width:'+(advFrac*52).toFixed(0)+'px;background:'+advCol+'"></span></span>'
           + '<span style="font-size:11px;color:'+advCol+'">'+adv+'</span></span></td>'
           + '<td class="'+pnlClass(p.pnlUsd)+'">'+fmtUsd(p.pnlUsd)+'</td>'
@@ -1385,26 +1574,22 @@ async function refresh(){
         else skips++
       })
       $('scannerSummary').textContent = d.scanDecisions.length+' assets · '+enters+' entered · '+skips+' skipped'+(holding?' · '+holding+' held':'')
-      if(d.lastScanAt) $('scannerTs').textContent = 'last scan ' + new Date(d.lastScanAt).toLocaleTimeString()
-      $('scannerTbody').innerHTML = d.scanDecisions.map(function(s){
-        var aprStr = (s.apr>=0?'+':'') + s.apr.toFixed(1) + '%'
-        var side = s.isBuy ? '<span class="pill long">LONG</span>' : '<span class="pill short">SHORT</span>'
-        var vol = s.vol>=1e6 ? '$'+(s.vol/1e6).toFixed(1)+'M' : '$'+(s.vol/1e3).toFixed(0)+'K'
-        var dec = DEC[s.decision] || {cls:'dec-dim', label:s.decision}
-        return '<tr><td><b>'+esc(s.asset)+'</b></td>'
-          + '<td>'+side+'</td>'
-          + '<td class="'+(s.apr<0?'green':'red')+'" style="font-size:11px">'+aprStr+'</td>'
-          + '<td class="dim" style="font-size:11px">'+vol+'</td>'
-          + '<td><span class="badge-dec '+dec.cls+'">'+dec.label+'</span></td>'
-          + '<td class="reason">'+esc(s.reason||'—')+'</td></tr>'
-      }).join('')
+      scanCache = d.scanDecisions
+      var newScan = d.lastScanAt && d.lastScanAt !== lastScanAtVal
+      lastScanAtVal = d.lastScanAt || lastScanAtVal
+      renderScanner(newScan)
     }
 
-    // rates
+    // rates (with search filter)
+    ratesRaw = d.rates
     var rc = $('rateCount')
     rc.textContent = d.rates.length ? d.rates.length+' assets' : ''
     rc.style.display = d.rates.length ? 'inline-block' : 'none'
-    if(d.rates.length) renderRatesPage(d.rates, Math.min(_page, Math.ceil(d.rates.length/PAGE_SIZE)))
+    if(d.rates.length){
+      renderTape(d.rates)
+      var fr = filteredRates()
+      renderRatesPage(fr, Math.min(_page, Math.max(1, Math.ceil(fr.length/PAGE_SIZE))))
+    }
 
     // chart
     buildPnlChart(d.history)
@@ -1476,6 +1661,27 @@ async function saveConfig(){
   toggleCfg()
   refresh()
 }
+
+// ── rates search ─────────────────────────────────────
+var ratesRaw = [], rateQuery = ''
+function filteredRates(){
+  if(!rateQuery) return ratesRaw
+  return ratesRaw.filter(function(r){ return r.asset.toUpperCase().indexOf(rateQuery) !== -1 })
+}
+$('rateSearch').addEventListener('input', function(){
+  rateQuery = this.value.trim().toUpperCase()
+  renderRatesPage(filteredRates(), 1)
+})
+
+// ── scanner tab wiring ───────────────────────────────
+document.querySelectorAll('.tab').forEach(function(t){
+  t.addEventListener('click', function(){
+    document.querySelectorAll('.tab').forEach(function(x){ x.classList.remove('active') })
+    t.classList.add('active')
+    scanFilter = t.dataset.filter
+    renderScanner(true)
+  })
+})
 
 refresh()
 setInterval(refresh, 15000)
