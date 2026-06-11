@@ -8,7 +8,7 @@
 import { createServer } from 'http'
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs'
 import { join } from 'path'
-import { pathToFileURL, fileURLToPath } from 'url'
+import { pathToFileURL } from 'url'
 import { homedir } from 'os'
 import { createRequire } from 'module'
 
@@ -87,6 +87,7 @@ let regimeFlipTime    = 0          // timestamp when regime last flipped crowded
 let rateHistory       = {}         // { asset: [{apr, ts}] } — rolling 6-scan window
 let scanDecisions     = []         // per-asset decisions from last scan
 let lastScanAt        = null       // timestamp scan started
+const BOOT_TS         = Date.now()
 
 // ── PERSISTENT STATE ──────────────────────────────────────────────────────────
 function loadState() {
@@ -563,7 +564,9 @@ function apiStatus() {
   return { equity, avail, positions, openCount: positions.length, history: state.history.slice(0, 50),
     totalTrades, totalWins, totalLosses, totalClosedPnl,
     rates, paused, scanning, cfg: CFG, mode: CFG.dryRun ? 'DRY RUN' : 'LIVE',
-    wallet: identity.hl.address, hoursToSettle, scanDecisions, lastScanAt, ts: new Date().toISOString() }
+    wallet: identity.hl.address, hoursToSettle, scanDecisions, lastScanAt,
+    regime: btcFundingRegime, crowdedRatio: crowdedLongRatio, startedAt: BOOT_TS,
+    ts: new Date().toISOString() }
 }
 
 async function apiClose(asset) {
@@ -592,777 +595,887 @@ const HTML = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Funding Bot</title>
-<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+<meta name="theme-color" content="#0C0A07">
+<title>Funding Bot — Console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,600;12..96,700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-:root{--bg:#020209;--bg2:#04040f;--border:#0d0d2e;--border2:#1a1a4a;--accent:#00f5ff;--accent2:#7c3aed;--green:#00ff88;--red:#ff2d55;--yellow:#ffd60a;--text:#c8d6ff;--muted:#3a3a6a;--card:rgba(4,4,20,0.3)}
-body{background:var(--bg);color:var(--text);font-family:'Share Tech Mono',monospace;font-size:13px;min-height:100vh;overflow-x:hidden}
-body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(rgba(0,245,255,0.03) 1px,transparent 1px),linear-gradient(90deg,rgba(0,245,255,0.03) 1px,transparent 1px);background-size:60px 60px;animation:gridMove 20s linear infinite;pointer-events:none;z-index:1}
-body::after{content:'';position:fixed;inset:0;background:radial-gradient(ellipse at 50% 0%,rgba(124,58,237,0.12) 0%,transparent 60%),radial-gradient(ellipse at 100% 100%,rgba(0,245,255,0.08) 0%,transparent 50%);pointer-events:none;z-index:1}
-@keyframes gridMove{0%{background-position:0 0}100%{background-position:60px 60px}}
-#bgCanvas{position:fixed;inset:0;z-index:0;pointer-events:none}
-/* SCROLLBAR */
-::-webkit-scrollbar{width:3px;height:3px}::-webkit-scrollbar-track{background:rgba(0,0,0,0.2)}::-webkit-scrollbar-thumb{background:linear-gradient(180deg,#00f5ff,#7c3aed);border-radius:2px}
-/* HEADER */
-.header{position:sticky;top:0;z-index:100;background:rgba(2,2,9,0.92);border-bottom:1px solid var(--border2);padding:14px 24px;display:flex;align-items:center;gap:16px;backdrop-filter:blur(20px)}
-.header h1{font-family:'Orbitron',monospace;font-size:16px;font-weight:700;color:var(--accent);letter-spacing:3px;animation:hglow 3s ease-in-out infinite}
-@keyframes hglow{0%,100%{text-shadow:0 0 16px rgba(0,245,255,0.5)}50%{text-shadow:0 0 30px rgba(0,245,255,0.9),0 0 60px rgba(0,245,255,0.3)}}
-.badge{padding:3px 12px;border-radius:20px;font-size:11px;font-weight:600;letter-spacing:1px;display:inline-flex;align-items:center;gap:6px}
-.badge.live{background:rgba(0,255,136,0.08);color:var(--green);border:1px solid rgba(0,255,136,0.3)}
-.badge.dry{background:rgba(58,58,106,0.3);color:#888;border:1px solid var(--border2)}
-.badge.paused{background:rgba(255,214,10,0.08);color:var(--yellow);border:1px solid rgba(255,214,10,0.3)}
-.live-dot{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green);animation:pdot 1.8s ease-in-out infinite}
-@keyframes pdot{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.5);opacity:0.5}}
-.ts{margin-left:auto;color:var(--muted);font-size:11px}
-/* BODY */
-.body{position:relative;z-index:10;padding:20px 24px;display:flex;flex-direction:column;gap:16px}
-/* CARDS */
-.cards{display:flex;gap:12px;flex-wrap:wrap}
-.card{background:var(--card);border:1px solid var(--border2);border-radius:8px;padding:14px 18px;min-width:130px;flex:1;position:relative;overflow:hidden;transition:transform .15s,border-color .2s,box-shadow .2s;cursor:default;transform-style:preserve-3d;backdrop-filter:blur(12px)}
-.card:hover{border-color:rgba(0,245,255,0.3);box-shadow:0 8px 32px rgba(0,0,0,0.6),0 0 20px rgba(0,245,255,0.06)}
-.card::before{content:'';position:absolute;top:0;left:-100%;width:60%;height:100%;background:linear-gradient(90deg,transparent,rgba(0,245,255,0.04),transparent);transition:left .5s ease;pointer-events:none}
-.card:hover::before{left:140%}
-.card::after{content:'';position:absolute;bottom:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,var(--accent),transparent);transform:scaleX(0);transition:transform .3s}
-.card:hover::after{transform:scaleX(1)}
-.lbl{font-size:11px;text-transform:uppercase;color:#7aa8d4;margin-bottom:6px;letter-spacing:1.5px}
-.val{font-family:'Orbitron',monospace;font-size:20px;font-weight:700;color:var(--text);transition:text-shadow .2s}
-.val.green{color:var(--green)}.val.red{color:var(--red)}.val.yellow{color:var(--yellow)}
-.card:hover .val.green{text-shadow:0 0 14px rgba(0,255,136,0.6)}
-.card:hover .val.red{text-shadow:0 0 14px rgba(255,45,85,0.6)}
-/* SECTION */
-.section{position:relative;z-index:10;background:var(--card);border:1px solid var(--border2);border-radius:8px;overflow:hidden;backdrop-filter:blur(8px);transition:border-color .2s}
-.section:hover{border-color:rgba(0,245,255,0.15)}
-.section-head{padding:10px 16px;border-bottom:1px solid var(--border2);font-size:13px;text-transform:uppercase;color:var(--accent);letter-spacing:2px;display:flex;align-items:center;gap:8px;font-family:'Orbitron',monospace;text-shadow:0 0 10px rgba(0,245,255,0.35)}
-.section-head span:first-child{flex:1}
-.rate-count{font-family:'Orbitron',monospace;font-size:10px;color:var(--accent);background:rgba(0,245,255,0.06);border:1px solid rgba(0,245,255,0.2);padding:1px 10px;border-radius:20px}
-/* TABLES */
+:root{
+  --bg:#0C0A07;
+  --panel:#13100A;
+  --panel2:#181309;
+  --line:#272013;
+  --line2:#3A301C;
+  --amber:#FFB454;
+  --amber-soft:rgba(255,180,84,0.12);
+  --amber-line:rgba(255,180,84,0.35);
+  --ink:#EDE6D8;
+  --muted:#9A9078;
+  --faint:#5C543F;
+  --green:#46D68C;
+  --green-soft:rgba(70,214,140,0.10);
+  --red:#F25C5C;
+  --red-soft:rgba(242,92,92,0.10);
+  --yellow:#E8C547;
+  --yellow-soft:rgba(232,197,71,0.10);
+  --z-sticky:20;
+}
+html{background:var(--bg)}
+body{
+  background:
+    radial-gradient(1100px 380px at 50% -120px, rgba(255,180,84,0.05), transparent 70%),
+    var(--bg);
+  color:var(--ink);
+  font-family:'IBM Plex Mono',monospace;
+  font-size:13px;
+  line-height:1.5;
+  min-height:100vh;
+  -webkit-font-smoothing:antialiased;
+}
+::selection{background:var(--amber);color:#0C0A07}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--line2);border-radius:4px;border:2px solid var(--bg)}
+::-webkit-scrollbar-thumb:hover{background:var(--faint)}
+:focus-visible{outline:2px solid var(--amber);outline-offset:2px;border-radius:3px}
+
+/* ── HEADER ─────────────────────────────────────────── */
+.top{
+  position:sticky;top:0;z-index:var(--z-sticky);
+  display:flex;align-items:center;gap:14px;
+  padding:13px 22px;
+  background:rgba(12,10,7,0.88);
+  border-bottom:1px solid var(--line);
+  backdrop-filter:blur(14px);
+}
+.brand{
+  font-family:'Bricolage Grotesque',sans-serif;
+  font-weight:700;font-size:17px;letter-spacing:-0.02em;
+  color:var(--ink);white-space:nowrap;
+}
+.brand em{font-style:normal;color:var(--amber)}
+.chip{
+  display:inline-flex;align-items:center;gap:7px;
+  font-size:10.5px;font-weight:600;letter-spacing:0.08em;
+  padding:4px 11px;border-radius:3px;white-space:nowrap;
+}
+.chip.live{color:var(--green);background:var(--green-soft);border:1px solid rgba(70,214,140,0.3)}
+.chip.dry{color:var(--muted);background:rgba(154,144,120,0.08);border:1px solid var(--line2)}
+.chip.paused{color:var(--yellow);background:var(--yellow-soft);border:1px solid rgba(232,197,71,0.3)}
+.chip.regime-neutral{color:var(--muted);border:1px solid var(--line2);background:transparent}
+.chip.regime-crowded{color:var(--yellow);border:1px solid rgba(232,197,71,0.3);background:var(--yellow-soft)}
+.dot{width:6px;height:6px;border-radius:50%;background:currentColor;flex-shrink:0}
+.chip.live .dot{animation:breathe 2.4s ease-in-out infinite}
+@keyframes breathe{0%,100%{opacity:1}50%{opacity:0.35}}
+.top .updated{margin-left:auto;font-size:11px;color:var(--faint);white-space:nowrap}
+
+/* ── LAYOUT ─────────────────────────────────────────── */
+.wrap{
+  display:grid;grid-template-columns:minmax(0,1fr) 304px;
+  gap:16px;align-items:start;
+  max-width:1480px;margin:0 auto;padding:18px 22px 60px;
+}
+.col{display:flex;flex-direction:column;gap:16px;min-width:0}
+.rail{display:flex;flex-direction:column;gap:16px;position:sticky;top:72px}
+@media (max-width:1020px){
+  .wrap{grid-template-columns:1fr}
+  .rail{position:static;order:-1;display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));align-items:stretch}
+}
+
+/* ── PANELS ─────────────────────────────────────────── */
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:6px;overflow:hidden}
+.panel-head{
+  display:flex;align-items:baseline;gap:10px;
+  padding:11px 16px;border-bottom:1px solid var(--line);
+}
+.panel-head h2{
+  font-family:'Bricolage Grotesque',sans-serif;
+  font-size:13.5px;font-weight:600;letter-spacing:0.01em;color:var(--ink);
+}
+.panel-head .meta{font-size:10.5px;color:var(--faint)}
+.panel-head .right{margin-left:auto;font-size:10.5px;color:var(--faint)}
+.count-tag{
+  font-size:10px;color:var(--amber);background:var(--amber-soft);
+  border:1px solid var(--amber-line);padding:1px 8px;border-radius:10px;
+}
+
+/* scan sweep — visible only while scanning */
+.sweep{position:relative;height:2px;background:var(--line);overflow:hidden;display:none}
+.sweep.on{display:block}
+.sweep::after{
+  content:'';position:absolute;top:0;left:-30%;width:30%;height:100%;
+  background:linear-gradient(90deg,transparent,var(--amber),transparent);
+  animation:sweep 1.4s linear infinite;
+}
+@keyframes sweep{to{left:130%}}
+
+/* ── INSTRUMENT STRIP ───────────────────────────────── */
+.strip{
+  display:grid;grid-template-columns:repeat(6,1fr);
+  background:var(--panel);border:1px solid var(--line);border-radius:6px;
+  overflow:hidden;
+}
+.cell{padding:13px 16px 11px;border-right:1px solid var(--line);min-width:0}
+.cell:last-child{border-right:none}
+.cell .lbl{font-size:9.5px;letter-spacing:0.14em;color:var(--muted);text-transform:uppercase;margin-bottom:5px}
+.cell .val{
+  font-size:21px;font-weight:600;letter-spacing:-0.01em;
+  font-variant-numeric:tabular-nums;color:var(--ink);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.cell .sub{font-size:10px;color:var(--faint);margin-top:3px;font-variant-numeric:tabular-nums}
+.val.pos{color:var(--green)}.val.neg{color:var(--red)}
+.flash-up{animation:fup 0.7s ease-out}
+.flash-down{animation:fdn 0.7s ease-out}
+@keyframes fup{0%{color:var(--green);text-shadow:0 0 12px rgba(70,214,140,0.5)}100%{}}
+@keyframes fdn{0%{color:var(--red);text-shadow:0 0 12px rgba(242,92,92,0.5)}100%{}}
+@media (max-width:900px){.strip{grid-template-columns:repeat(3,1fr)}.cell:nth-child(3){border-right:none}.cell:nth-child(-n+3){border-bottom:1px solid var(--line)}}
+
+/* ── SETTLEMENT DIAL ────────────────────────────────── */
+.dial-panel{padding:18px 16px 16px;text-align:center}
+.dial-wrap{position:relative;width:158px;height:158px;margin:0 auto}
+.dial-wrap svg{transform:rotate(-90deg)}
+.dial-track{fill:none;stroke:var(--line);stroke-width:7}
+.dial-prog{
+  fill:none;stroke:var(--amber);stroke-width:7;stroke-linecap:round;
+  stroke-dasharray:327;transition:stroke-dashoffset 0.5s linear, stroke 0.4s;
+}
+.dial-prog.danger{stroke:var(--red)}
+.dial-center{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px}
+.dial-time{font-size:27px;font-weight:600;font-variant-numeric:tabular-nums;letter-spacing:0.01em;color:var(--ink)}
+.dial-cap{font-size:8.5px;letter-spacing:0.18em;color:var(--muted);text-transform:uppercase}
+.dial-status{display:inline-flex;align-items:center;gap:7px;margin-top:13px;font-size:10.5px;letter-spacing:0.06em;font-weight:600}
+.dial-status.ok{color:var(--green)}
+.dial-status.blocked{color:var(--red)}
+.dial-note{margin-top:7px;font-size:10px;color:var(--faint)}
+
+/* ── CONTROLS ───────────────────────────────────────── */
+.controls{display:flex;flex-direction:column;gap:8px;padding:14px 16px}
+.btn{
+  font-family:'IBM Plex Mono',monospace;
+  display:inline-flex;align-items:center;justify-content:center;gap:8px;
+  font-size:11.5px;font-weight:600;letter-spacing:0.05em;
+  padding:9px 14px;border-radius:4px;cursor:pointer;
+  border:1px solid var(--line2);background:var(--panel2);color:var(--ink);
+  transition:border-color 0.15s,background 0.15s,color 0.15s;
+  min-height:36px;width:100%;
+}
+.btn:hover{border-color:var(--amber-line);background:var(--amber-soft);color:var(--amber)}
+.btn:disabled{opacity:0.45;cursor:default}
+.btn.warn:hover{border-color:rgba(232,197,71,0.4);background:var(--yellow-soft);color:var(--yellow)}
+.btn-close{
+  font-family:'IBM Plex Mono',monospace;font-size:10.5px;font-weight:600;
+  padding:4px 11px;border-radius:3px;cursor:pointer;min-height:26px;
+  background:transparent;color:var(--red);border:1px solid rgba(242,92,92,0.35);
+  transition:background 0.15s;
+}
+.btn-close:hover{background:var(--red-soft)}
+
+/* ── CONFIG ─────────────────────────────────────────── */
+.cfg-panel{display:none;padding:6px 16px 16px;border-top:1px solid var(--line)}
+.cfg-panel.open{display:block}
+.cfg-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px 12px;margin-top:10px}
+.cfg-field{display:flex;flex-direction:column;gap:4px;min-width:0}
+.cfg-field label{font-size:9px;letter-spacing:0.1em;text-transform:uppercase;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cfg-field input,.cfg-field select{
+  font-family:'IBM Plex Mono',monospace;font-size:12px;
+  background:var(--bg);border:1px solid var(--line2);color:var(--ink);
+  padding:6px 8px;border-radius:3px;width:100%;
+}
+.cfg-field input:focus,.cfg-field select:focus{border-color:var(--amber-line);outline:none}
+.btn-save{margin-top:12px}
+
+/* ── ACCOUNT ────────────────────────────────────────── */
+.acct{padding:13px 16px;display:flex;flex-direction:column;gap:8px}
+.acct-row{display:flex;justify-content:space-between;gap:10px;font-size:11px}
+.acct-row .k{color:var(--muted)}
+.acct-row .v{color:var(--ink);font-variant-numeric:tabular-nums;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* ── TABLES ─────────────────────────────────────────── */
 table{width:100%;border-collapse:collapse}
-th{padding:8px 10px;text-align:left;font-size:10px;text-transform:uppercase;color:var(--muted);letter-spacing:1px;border-bottom:1px solid var(--border);font-weight:500}
-td{padding:9px 10px;border-bottom:1px solid rgba(13,13,46,0.8);transition:background .15s;color:var(--text)}
+th{
+  padding:8px 14px;text-align:left;
+  font-size:9.5px;font-weight:500;letter-spacing:0.12em;text-transform:uppercase;
+  color:var(--faint);border-bottom:1px solid var(--line);white-space:nowrap;
+}
+td{
+  padding:10px 14px;border-bottom:1px solid rgba(39,32,19,0.6);
+  font-variant-numeric:tabular-nums;vertical-align:middle;
+}
 tr:last-child td{border-bottom:none}
-tr:hover td{background:rgba(0,245,255,0.03)}
-.pill{display:inline-block;padding:2px 9px;border-radius:4px;font-size:11px;font-weight:600;letter-spacing:.5px}
-.pill.long{background:rgba(0,255,136,0.1);color:var(--green);border:1px solid rgba(0,255,136,0.3)}
-.pill.short{background:rgba(255,45,85,0.1);color:var(--red);border:1px solid rgba(255,45,85,0.3)}
+tbody tr{transition:background 0.12s}
+tbody tr:hover{background:rgba(255,180,84,0.035)}
+.empty{text-align:center;padding:30px 16px;color:var(--faint);font-size:12px}
 .green{color:var(--green)}.red{color:var(--red)}.yellow{color:var(--yellow)}.dim{color:var(--muted)}
-tr:hover .green{text-shadow:0 0 8px rgba(0,255,136,0.4)}
-tr:hover .red{text-shadow:0 0 8px rgba(255,45,85,0.4)}
-/* BUTTONS */
-.btn{border:none;border-radius:5px;padding:4px 12px;font-size:11px;cursor:pointer;font-weight:600;transition:all .15s;font-family:'Share Tech Mono',monospace}
-.btn-close{background:rgba(255,45,85,0.1);color:var(--red);border:1px solid rgba(255,45,85,0.3)}.btn-close:hover{background:rgba(255,45,85,0.2);box-shadow:0 0 10px rgba(255,45,85,0.2)}
-.btn-scan{background:rgba(0,255,136,0.08);color:var(--green);border:1px solid rgba(0,255,136,0.3);padding:6px 16px}.btn-scan:hover{background:rgba(0,255,136,0.15);box-shadow:0 0 14px rgba(0,255,136,0.2)}
-.btn-pause{background:rgba(255,214,10,0.08);color:var(--yellow);border:1px solid rgba(255,214,10,0.3);padding:6px 16px}.btn-pause:hover{background:rgba(255,214,10,0.15)}
-.btn-cfg{background:rgba(58,58,106,0.3);color:#888;border:1px solid var(--border2);padding:6px 14px}.btn-cfg:hover{background:rgba(58,58,106,0.5)}
-.controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding:12px 16px}
-.empty{text-align:center;padding:28px;color:var(--muted)}
-.cfg-panel{padding:14px 16px;border-top:1px solid var(--border);display:none;gap:16px;flex-wrap:wrap}
-.cfg-panel.open{display:flex}
-.cfg-field{display:flex;flex-direction:column;gap:4px}
-.cfg-field label{font-size:10px;text-transform:uppercase;color:var(--muted)}
-.cfg-field input,.cfg-field select{background:rgba(4,4,20,0.9);border:1px solid var(--border2);color:var(--text);padding:5px 8px;border-radius:4px;width:90px;font-size:12px;font-family:'Share Tech Mono',monospace}
-.btn-save{background:rgba(0,245,255,0.08);color:var(--accent);border:1px solid rgba(0,245,255,0.3);padding:5px 14px;align-self:flex-end}
-/* APR BAR */
-.apr-wrap{display:inline-flex;align-items:center;gap:7px}
-.apr-bar-bg{width:64px;height:7px;background:rgba(255,255,255,0.04);border-radius:3px;overflow:hidden;flex-shrink:0}
-.apr-bar{height:100%;border-radius:3px;position:relative;overflow:hidden}
-.apr-bar::after{content:'';position:absolute;inset:0;background:linear-gradient(90deg,transparent,rgba(255,255,255,0.3),transparent);animation:abar 2.2s ease-in-out infinite}
-@keyframes abar{0%{transform:translateX(-100%)}100%{transform:translateX(200%)}}
-/* PAGINATION */
-.pagination{display:flex;align-items:center;justify-content:space-between;padding:10px 16px;border-top:1px solid var(--border);background:rgba(0,0,0,0.2)}
-.page-info{font-size:11px;color:var(--muted)}
-.page-info b{color:var(--accent);font-family:'Orbitron',monospace}
-.page-btns{display:flex;gap:5px}
-.pbtn{background:rgba(4,4,20,0.6);border:1px solid var(--border2);color:var(--muted);padding:3px 11px;border-radius:4px;font-size:11px;cursor:pointer;transition:all .15s}
-.pbtn:hover:not(:disabled){border-color:var(--accent);color:var(--accent);box-shadow:0 0 8px rgba(0,245,255,0.1)}
-.pbtn:disabled{opacity:.3;cursor:default}
-.pbtn.active{background:rgba(0,245,255,0.08);border-color:rgba(0,245,255,0.4);color:var(--accent)}
-/* SPACED ROWS */
-.spaced-rows tr td{padding:13px 10px}
-.spaced-rows tr{border-bottom:1px solid rgba(0,245,255,0.04)}
+.pill{
+  display:inline-block;padding:2px 9px;border-radius:3px;
+  font-size:10px;font-weight:600;letter-spacing:0.07em;
+}
+.pill.long{background:var(--green-soft);color:var(--green);border:1px solid rgba(70,214,140,0.3)}
+.pill.short{background:var(--red-soft);color:var(--red);border:1px solid rgba(242,92,92,0.3)}
+.badge-dec{
+  display:inline-block;padding:2px 8px;border-radius:3px;
+  font-size:9.5px;font-weight:600;letter-spacing:0.08em;white-space:nowrap;
+}
+.dec-enter{background:var(--green-soft);color:var(--green);border:1px solid rgba(70,214,140,0.35)}
+.dec-hold{background:var(--amber-soft);color:var(--amber);border:1px solid var(--amber-line)}
+.dec-skip{background:var(--red-soft);color:var(--red);border:1px solid rgba(242,92,92,0.3)}
+.dec-cool{background:var(--yellow-soft);color:var(--yellow);border:1px solid rgba(232,197,71,0.3)}
+.dec-dim{background:rgba(154,144,120,0.07);color:var(--muted);border:1px solid var(--line2)}
+.reason{font-size:11px;color:var(--muted)}
+
+/* adverse meter */
+.meter{display:inline-flex;align-items:center;gap:7px}
+.meter-bg{width:52px;height:4px;background:var(--line);border-radius:2px;overflow:hidden;flex-shrink:0}
+.meter-fill{height:100%;border-radius:2px;transition:width 0.4s}
+
+/* apr bar */
+.apr-wrap{display:inline-flex;align-items:center;gap:8px}
+.apr-bg{width:58px;height:5px;background:var(--line);border-radius:2px;overflow:hidden;flex-shrink:0}
+.apr-fill{height:100%;border-radius:2px}
+
+/* ── PAGINATION ─────────────────────────────────────── */
+.pagination{display:flex;align-items:center;justify-content:space-between;padding:9px 14px;border-top:1px solid var(--line)}
+.page-info{font-size:10.5px;color:var(--faint)}
+.page-info b{color:var(--amber);font-weight:600}
+.page-btns{display:flex;gap:4px}
+.pbtn{
+  font-family:'IBM Plex Mono',monospace;
+  background:transparent;border:1px solid var(--line2);color:var(--muted);
+  padding:3px 10px;border-radius:3px;font-size:10.5px;cursor:pointer;
+  transition:border-color 0.12s,color 0.12s;min-height:24px;
+}
+.pbtn:hover:not(:disabled){border-color:var(--amber-line);color:var(--amber)}
+.pbtn:disabled{opacity:0.3;cursor:default}
+.pbtn.active{background:var(--amber-soft);border-color:var(--amber-line);color:var(--amber)}
+
+/* chart */
+.chart-box{padding:14px 16px;position:relative;height:280px}
+#pnlEmpty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--faint);font-size:12px}
+
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation:none !important;transition:none !important}
+}
 </style>
 </head>
 <body>
-<canvas id="bgCanvas"></canvas>
-<canvas id="pnlStars" style="position:fixed;inset:0;width:100%;height:100%;pointer-events:none;z-index:999"></canvas>
-<div class="header">
-  <h1>Funding Bot</h1>
-  <span class="badge live" id="modeBadge"><span class="live-dot"></span>LIVE</span>
-  <span class="badge" id="pauseBadge" style="display:none">PAUSED</span>
-  <span class="ts" id="ts">—</span>
-</div>
-<div class="body">
-  <div class="cards">
-    <div class="card"><div class="lbl">Equity</div><div class="val" id="equity">—</div></div>
-    <div class="card"><div class="lbl">Available</div><div class="val" id="avail">—</div></div>
-    <div class="card"><div class="lbl">Positions</div><div class="val" id="openCount">—</div></div>
-    <div class="card" id="openPnlCard"><div class="lbl">Open P&amp;L</div><div class="val" id="openPnl">—</div></div>
-    <div class="card">
-      <div class="lbl">Realised PnL</div>
-      <div class="val" id="closedPnl">—</div>
-      <div style="display:flex;gap:10px;margin-top:6px;font-size:11px">
-        <span style="color:var(--green)">▲ <span id="winCount">0</span>W</span>
-        <span style="color:var(--red)">▼ <span id="lossCount">0</span>L</span>
-        <span style="color:#7aa8d4"><span id="winRate">—</span> WR</span>
+
+<header class="top">
+  <div class="brand">FUNDING<em>BOT</em></div>
+  <span class="chip live" id="modeBadge"><span class="dot"></span>LIVE</span>
+  <span class="chip paused" id="pauseBadge" style="display:none">PAUSED</span>
+  <span class="chip regime-neutral" id="regimeChip" style="display:none"></span>
+  <span class="updated" id="ts">connecting…</span>
+</header>
+
+<div class="wrap">
+
+  <!-- MAIN COLUMN -->
+  <div class="col">
+
+    <!-- Instrument strip -->
+    <div class="strip" role="group" aria-label="Account metrics">
+      <div class="cell"><div class="lbl">Equity</div><div class="val" id="equity">—</div></div>
+      <div class="cell"><div class="lbl">Available</div><div class="val" id="avail">—</div></div>
+      <div class="cell"><div class="lbl">Open P&amp;L</div><div class="val" id="openPnl">—</div></div>
+      <div class="cell">
+        <div class="lbl">Realised P&amp;L</div><div class="val" id="closedPnl">—</div>
+        <div class="sub"><span class="green"><span id="winCount">0</span>W</span> · <span class="red"><span id="lossCount">0</span>L</span> · <span id="winRate">—</span> WR</div>
+      </div>
+      <div class="cell"><div class="lbl">Positions</div><div class="val" id="openCount">—</div></div>
+      <div class="cell"><div class="lbl">Trades</div><div class="val" id="totalTrades">—</div></div>
+    </div>
+
+    <!-- Open Positions -->
+    <div class="panel">
+      <div class="panel-head"><h2>Open Positions</h2><span class="count-tag" id="posCount" style="display:none"></span></div>
+      <div style="overflow-x:auto">
+      <table>
+        <thead><tr><th>Asset</th><th>Side</th><th>Entry</th><th>Mid</th><th>Trend</th><th>APR</th><th>Held</th><th>Adverse</th><th>P&amp;L</th><th></th></tr></thead>
+        <tbody id="posTbody"><tr><td colspan="10" class="empty">No open positions</td></tr></tbody>
+      </table>
       </div>
     </div>
-    <div class="card"><div class="lbl">Total Trades</div><div class="val" id="totalTrades">—</div></div>
-    <div class="card"><div class="lbl">Next Settlement</div><div class="val" id="settleCountdown">—</div><div style="font-size:10px;margin-top:4px" id="settleStatus"></div></div>
+
+    <!-- Scanner Log -->
+    <div class="panel">
+      <div class="panel-head">
+        <h2>Scanner</h2>
+        <span class="meta" id="scannerSummary"></span>
+        <span class="right" id="scannerTs">waiting for first scan…</span>
+      </div>
+      <div class="sweep" id="scanSweep"></div>
+      <div style="overflow-x:auto">
+      <table>
+        <thead><tr><th>Asset</th><th>Side</th><th>APR</th><th>Vol 24h</th><th>Decision</th><th>Reason</th></tr></thead>
+        <tbody id="scannerTbody"><tr><td colspan="6" class="empty">Scan results appear after first scan</td></tr></tbody>
+      </table>
+      </div>
+    </div>
+
+    <!-- PnL Chart -->
+    <div class="panel">
+      <div class="panel-head">
+        <h2>P&amp;L Since Inception</h2>
+        <span class="meta" id="pnlChartTotal"></span>
+        <span class="right"><span class="green">●</span> win&nbsp;&nbsp;<span class="red">●</span> loss</span>
+      </div>
+      <div class="chart-box">
+        <canvas id="pnlChart" aria-label="Cumulative profit and loss chart" role="img"></canvas>
+        <div id="pnlEmpty" style="display:none">No closed trades yet — chart appears after first close</div>
+      </div>
+    </div>
+
+    <!-- Funding Rates -->
+    <div class="panel">
+      <div class="panel-head"><h2>Funding Rates</h2><span class="count-tag" id="rateCount" style="display:none"></span></div>
+      <div style="overflow-x:auto">
+      <table>
+        <thead><tr><th>Asset</th><th>APR</th><th>Direction</th><th>Vol 24h</th><th>Signal</th></tr></thead>
+        <tbody id="ratesTbody"><tr><td colspan="5" class="empty">Rates load after first scan</td></tr></tbody>
+      </table>
+      </div>
+      <div class="pagination" id="ratesPager" style="display:none">
+        <div class="page-info">Page <b id="pgNum">1</b> / <b id="pgTotal">1</b> · <b id="pgShowing">—</b></div>
+        <div class="page-btns" id="pgBtns"></div>
+      </div>
+    </div>
+
+    <!-- Trade History -->
+    <div class="panel">
+      <div class="panel-head"><h2>Trade History</h2><span class="count-tag" id="histCount" style="display:none"></span></div>
+      <div style="overflow-x:auto">
+      <table>
+        <thead><tr><th>Asset</th><th>Side</th><th>Entry</th><th>Exit</th><th>APR</th><th>Held</th><th>P&amp;L</th><th>Reason</th><th>Closed</th></tr></thead>
+        <tbody id="histTbody"><tr><td colspan="9" class="empty">No closed trades yet</td></tr></tbody>
+      </table>
+      </div>
+      <div class="pagination" id="histPager" style="display:none">
+        <div class="page-info">Page <b id="hpgNum">1</b> / <b id="hpgTotal">1</b> · <b id="hpgShowing">—</b></div>
+        <div class="page-btns" id="hpgBtns"></div>
+      </div>
+    </div>
+
   </div>
 
-  <!-- PnL Chart -->
-  <div class="section">
-    <div class="section-head" style="display:flex;align-items:center">
-      <span>PnL Since Inception</span>
-      <span id="pnlChartTotal" style="font-family:'Orbitron',monospace;font-size:11px;margin-left:8px"></span>
-      <span style="margin-left:auto;display:flex;gap:10px;align-items:center">
-        <span style="font-size:10px;color:#64748b">
-          <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#16a34a;margin-right:4px;vertical-align:middle"></span>Win
-          <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#dc2626;margin:0 4px 0 10px;vertical-align:middle"></span>Loss
-        </span>
-      </span>
-    </div>
-    <div style="padding:16px;position:relative;height:300px">
-      <canvas id="pnlChart"></canvas>
-      <div id="pnlEmpty" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#94a3b8;font-size:13px;display:none">No closed trades yet — chart will appear after first trade closes</div>
-    </div>
-  </div>
+  <!-- RAIL -->
+  <aside class="rail">
 
-  <!-- Controls -->
-  <div class="section">
-    <div class="section-head"><span>Controls</span></div>
-    <div class="controls">
-      <button class="btn btn-scan" onclick="triggerScan()">⟳ Scan Now</button>
-      <button class="btn btn-pause" id="pauseBtn" onclick="togglePause()">⏸ Pause Bot</button>
-      <button class="btn btn-cfg" onclick="toggleCfg()">⚙ Config</button>
-      <span id="scanStatus" style="color:var(--muted);font-size:11px;margin-left:4px"></span>
+    <!-- Settlement dial -->
+    <div class="panel dial-panel">
+      <div class="dial-wrap">
+        <svg width="158" height="158" viewBox="0 0 120 120" aria-hidden="true">
+          <circle class="dial-track" cx="60" cy="60" r="52"></circle>
+          <circle class="dial-prog" id="dialProg" cx="60" cy="60" r="52" stroke-dashoffset="0"></circle>
+        </svg>
+        <div class="dial-center">
+          <div class="dial-time" id="dialTime">--:--</div>
+          <div class="dial-cap">to settlement</div>
+        </div>
+      </div>
+      <div class="dial-status ok" id="dialStatus"><span class="dot"></span><span id="dialStatusTxt">—</span></div>
+      <div class="dial-note">funding pays hourly on the hour UTC</div>
     </div>
-    <div class="cfg-panel" id="cfgPanel">
-      <div class="cfg-field"><label>Min APR %</label><input id="cfgApr" type="number" step="1"></div>
-      <div class="cfg-field"><label>Min Hrs to Settle</label><input id="cfgSettle" type="number" step="0.1"></div>
-      <div class="cfg-field"><label>Max Hrs to Settle</label><input id="cfgMaxSettle" type="number" step="0.1"></div>
-      <div class="cfg-field"><label>Exit After Settle (min)</label><input id="cfgExitSettle" type="number" step="5"></div>
-      <div class="cfg-field"><label>Max Volatility %</label><input id="cfgVol" type="number" step="0.5"></div>
-      <div class="cfg-field"><label>Trend Filter</label><select id="cfgTrend" style="background:#0a0a0a;border:1px solid #2a2a2a;color:#d4d4d4;padding:5px 8px;border-radius:4px;font-size:12px"><option value="true">On</option><option value="false">Off</option></select></div>
-      <div class="cfg-field"><label>Position USD (base)</label><input id="cfgPos" type="number" step="1"></div>
-      <div class="cfg-field"><label>Max Position USD</label><input id="cfgMaxPos2" type="number" step="5"></div>
-      <div class="cfg-field"><label>Dynamic Sizing</label><select id="cfgDynSize" style="background:#0a0a0a;border:1px solid #2a2a2a;color:#d4d4d4;padding:5px 8px;border-radius:4px;font-size:12px"><option value="true">On</option><option value="false">Off</option></select></div>
-      <div class="cfg-field"><label>Stop Loss %</label><input id="cfgSL" type="number" step="0.1"></div>
-      <div class="cfg-field"><label>Trailing Stop %</label><input id="cfgTS" type="number" step="0.1"></div>
-      <div class="cfg-field"><label>High APR Threshold %</label><input id="cfgHighAprThr" type="number" step="10"></div>
-      <div class="cfg-field"><label>Trail % (High APR)</label><input id="cfgTSHigh" type="number" step="0.5"></div>
-      <div class="cfg-field"><label>Max Hold Hrs</label><input id="cfgHold" type="number" step="1"></div>
-      <div class="cfg-field"><label>Max Positions</label><input id="cfgMaxPos" type="number" step="1"></div>
-      <div class="cfg-field"><label>Max Settlements</label><input id="cfgMaxSettle2" type="number" step="1"></div>
-      <div class="cfg-field"><label>Max Settlements (High APR)</label><input id="cfgMaxSettleHigh" type="number" step="1"></div>
-      <div class="cfg-field"><label>APR Trend Filter</label><select id="cfgAprTrend" style="background:#0a0a0a;border:1px solid #2a2a2a;color:#d4d4d4;padding:5px 8px;border-radius:4px;font-size:12px"><option value="true">On</option><option value="false">Off</option></select></div>
-      <div class="cfg-field"><label>Regime Flip Cooldown (min)</label><input id="cfgRegimeCooldown" type="number" step="1"></div>
-      <button class="btn btn-save" onclick="saveConfig()">Save</button>
-    </div>
-  </div>
 
-  <!-- Scanner Log -->
-  <div class="section">
-    <div class="section-head" style="display:flex;align-items:center;gap:8px">
-      <span>Scanner Log</span>
-      <span id="scannerSummary" style="font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--muted);background:rgba(0,245,255,0.04);border:1px solid rgba(0,245,255,0.12);padding:1px 9px;border-radius:20px"></span>
-      <span id="scannerTs" style="margin-left:auto;font-size:10px;color:var(--muted)">Waiting for first scan…</span>
+    <!-- Controls -->
+    <div class="panel">
+      <div class="panel-head"><h2>Controls</h2><span class="right" id="scanStatus"></span></div>
+      <div class="controls">
+        <button class="btn" onclick="triggerScan()">SCAN NOW</button>
+        <button class="btn warn" id="pauseBtn" onclick="togglePause()">PAUSE BOT</button>
+        <button class="btn" onclick="toggleCfg()" aria-expanded="false" id="cfgToggle">CONFIG</button>
+      </div>
+      <div class="cfg-panel" id="cfgPanel">
+        <div class="cfg-grid">
+          <div class="cfg-field"><label for="cfgApr">Min APR %</label><input id="cfgApr" type="number" step="1"></div>
+          <div class="cfg-field"><label for="cfgSettle">Min Hrs to Settle</label><input id="cfgSettle" type="number" step="0.1"></div>
+          <div class="cfg-field"><label for="cfgMaxSettle">Max Hrs to Settle</label><input id="cfgMaxSettle" type="number" step="0.1"></div>
+          <div class="cfg-field"><label for="cfgExitSettle">Exit After Settle min</label><input id="cfgExitSettle" type="number" step="1"></div>
+          <div class="cfg-field"><label for="cfgVol">Max Volatility %</label><input id="cfgVol" type="number" step="0.5"></div>
+          <div class="cfg-field"><label for="cfgTrend">Trend Filter</label><select id="cfgTrend"><option value="true">On</option><option value="false">Off</option></select></div>
+          <div class="cfg-field"><label for="cfgPos">Position USD</label><input id="cfgPos" type="number" step="1"></div>
+          <div class="cfg-field"><label for="cfgMaxPos2">Max Position USD</label><input id="cfgMaxPos2" type="number" step="5"></div>
+          <div class="cfg-field"><label for="cfgDynSize">Dynamic Sizing</label><select id="cfgDynSize"><option value="true">On</option><option value="false">Off</option></select></div>
+          <div class="cfg-field"><label for="cfgSL">Stop Loss %</label><input id="cfgSL" type="number" step="0.1"></div>
+          <div class="cfg-field"><label for="cfgTS">Trailing Stop %</label><input id="cfgTS" type="number" step="0.1"></div>
+          <div class="cfg-field"><label for="cfgHighAprThr">High APR Threshold</label><input id="cfgHighAprThr" type="number" step="10"></div>
+          <div class="cfg-field"><label for="cfgTSHigh">Trail % High APR</label><input id="cfgTSHigh" type="number" step="0.5"></div>
+          <div class="cfg-field"><label for="cfgHold">Max Hold Hrs</label><input id="cfgHold" type="number" step="1"></div>
+          <div class="cfg-field"><label for="cfgMaxPos">Max Positions</label><input id="cfgMaxPos" type="number" step="1"></div>
+          <div class="cfg-field"><label for="cfgMaxSettle2">Max Settlements</label><input id="cfgMaxSettle2" type="number" step="1"></div>
+          <div class="cfg-field"><label for="cfgMaxSettleHigh">Max Settl. High APR</label><input id="cfgMaxSettleHigh" type="number" step="1"></div>
+          <div class="cfg-field"><label for="cfgAprTrend">APR Trend Filter</label><select id="cfgAprTrend"><option value="true">On</option><option value="false">Off</option></select></div>
+          <div class="cfg-field"><label for="cfgRegimeCooldown">Regime Cooldown min</label><input id="cfgRegimeCooldown" type="number" step="1"></div>
+        </div>
+        <button class="btn btn-save" onclick="saveConfig()">SAVE CONFIG</button>
+      </div>
     </div>
-    <table>
-      <thead><tr><th>Asset</th><th>Side</th><th style="width:120px">APR</th><th>Volume 24h</th><th style="width:130px">Decision</th><th>Reason</th></tr></thead>
-      <tbody id="scannerTbody" class="spaced-rows"><tr><td colspan="6" class="empty dim">Scan results appear here after first scan</td></tr></tbody>
-    </table>
-  </div>
 
-  <!-- Open Positions -->
-  <div class="section">
-    <div class="section-head"><span>Open Positions</span><span id="posCount" class="rate-count" style="display:none"></span></div>
-    <table>
-      <thead><tr><th>Asset</th><th>Side</th><th>Entry</th><th>Mid</th><th>Funding APR</th><th>Held</th><th>Adverse</th><th>P&L</th><th></th></tr></thead>
-      <tbody id="posTbody"><tr><td colspan="9" class="empty dim">No open positions</td></tr></tbody>
-    </table>
-  </div>
-
-  <!-- Funding Rates (paginated) -->
-  <div class="section">
-    <div class="section-head"><span>Live Funding Rates</span><span id="rateCount" class="rate-count" style="display:none"></span></div>
-    <table>
-      <thead><tr><th style="width:80px">Asset</th><th style="width:160px">APR</th><th style="width:110px">Direction</th><th style="width:85px">Vol 24h</th><th>Signal</th></tr></thead>
-      <tbody id="ratesTbody" class="spaced-rows"><tr><td colspan="5" class="empty dim">Rates load after first scan</td></tr></tbody>
-    </table>
-    <div class="pagination" id="ratesPager" style="display:none">
-      <div class="page-info">Page <b id="pgNum">1</b> of <b id="pgTotal">1</b> · <b id="pgShowing">—</b> entries</div>
-      <div class="page-btns" id="pgBtns"></div>
+    <!-- Account -->
+    <div class="panel">
+      <div class="panel-head"><h2>Account</h2></div>
+      <div class="acct">
+        <div class="acct-row"><span class="k">wallet</span><span class="v" id="acctWallet">—</span></div>
+        <div class="acct-row"><span class="k">mode</span><span class="v" id="acctMode">—</span></div>
+        <div class="acct-row"><span class="k">uptime</span><span class="v" id="acctUptime">—</span></div>
+        <div class="acct-row"><span class="k">scan every</span><span class="v" id="acctScan">—</span></div>
+      </div>
     </div>
-  </div>
 
-  <!-- Trade History -->
-  <div class="section">
-    <div class="section-head"><span>Trade History</span><span id="histCount" class="rate-count" style="display:none"></span></div>
-    <table>
-      <thead><tr><th>Asset</th><th>Side</th><th>Entry</th><th>Exit</th><th>Funding APR</th><th>Held</th><th>P&L</th><th>Reason</th><th>Closed</th></tr></thead>
-      <tbody id="histTbody" class="spaced-rows"><tr><td colspan="9" class="empty dim">No closed trades yet</td></tr></tbody>
-    </table>
-    <div class="pagination" id="histPager" style="display:none">
-      <div class="page-info">Page <b id="hpgNum">1</b> of <b id="hpgTotal">1</b> · <b id="hpgShowing">—</b> entries</div>
-      <div class="page-btns" id="hpgBtns"></div>
-    </div>
-  </div>
+  </aside>
 </div>
 
 <script>
-// ── VIVID PARTICLE BACKGROUND ─────────────────────────────────────────────────
-(function(){
-  const cv = document.getElementById('bgCanvas')
-  const cx = cv.getContext('2d')
-  let W, H, pts=[], orbs=[], shooters=[], t=0
-  const rsz=()=>{W=cv.width=innerWidth;H=cv.height=innerHeight}
-  rsz(); window.addEventListener('resize',rsz)
-  const OCOLS=[[0,245,255],[124,58,237],[0,255,136],[255,45,85],[255,214,10],[124,58,237]]
-  for(let i=0;i<8;i++) orbs.push({x:Math.random()*1400,y:Math.random()*900,r:200+Math.random()*280,vx:(Math.random()-.5)*.18,vy:(Math.random()-.5)*.14,c:OCOLS[i%OCOLS.length],ph:Math.random()*Math.PI*2,sp:0.0004+Math.random()*0.0003})
-  const PCOLS=['0,245,255','124,58,237','0,255,136','255,45,85','255,214,10','200,214,255']
-  const mkP=()=>({x:Math.random()*W,y:Math.random()*H,r:Math.random()*1.8+.4,vx:(Math.random()-.5)*.3,vy:(Math.random()-.5)*.3,a:Math.random()*.7+.2,c:PCOLS[Math.floor(Math.random()*PCOLS.length)],tw:Math.random()*Math.PI*2,ts:.02+Math.random()*.03})
-  for(let i=0;i<180;i++) pts.push(mkP())
-  const mkS=()=>({x:-50,y:Math.random()*H*.6,vx:6+Math.random()*4,vy:1+Math.random()*2,life:1,tail:[]})
-  setInterval(()=>{if(shooters.length<3)shooters.push(mkS())},3000)
-  ;(function draw(ts=0){
-    t=ts*.001
-    cx.fillStyle='rgba(2,2,9,0.2)'; cx.fillRect(0,0,W,H)
-    orbs.forEach(o=>{
-      o.x+=o.vx; o.y+=o.vy
-      if(o.x<-o.r)o.x=W+o.r; if(o.x>W+o.r)o.x=-o.r; if(o.y<-o.r)o.y=H+o.r; if(o.y>H+o.r)o.y=-o.r
-      const p=.08+Math.sin(t*o.sp*1000+o.ph)*.05
-      const g=cx.createRadialGradient(o.x,o.y,0,o.x,o.y,o.r)
-      g.addColorStop(0,\`rgba(\${o.c},\${p})\`); g.addColorStop(.5,\`rgba(\${o.c},\${p*.3})\`); g.addColorStop(1,\`rgba(\${o.c},0)\`)
-      cx.fillStyle=g; cx.beginPath(); cx.arc(o.x,o.y,o.r,0,Math.PI*2); cx.fill()
-    })
-    cx.strokeStyle='rgba(0,245,255,0.03)'; cx.lineWidth=.5
-    for(let x=0;x<W;x+=80){cx.beginPath();cx.moveTo(x,0);cx.lineTo(x,H);cx.stroke()}
-    for(let y=0;y<H;y+=80){cx.beginPath();cx.moveTo(0,y);cx.lineTo(W,y);cx.stroke()}
-    pts.forEach(p=>{
-      p.x+=p.vx; p.y+=p.vy
-      if(p.x<0)p.x=W; if(p.x>W)p.x=0; if(p.y<0)p.y=H; if(p.y>H)p.y=0
-      p.tw+=p.ts; const a=p.a*(.6+.4*Math.sin(p.tw))
-      cx.beginPath(); cx.arc(p.x,p.y,p.r,0,Math.PI*2); cx.fillStyle=\`rgba(\${p.c},\${a})\`; cx.fill()
-      cx.beginPath();cx.arc(p.x,p.y,p.r*4,0,Math.PI*2);cx.fillStyle=\`rgba(\${p.c},\${a*.18})\`;cx.fill()
-      if(p.a>.3){cx.beginPath();cx.arc(p.x,p.y,p.r*9,0,Math.PI*2);cx.fillStyle=\`rgba(\${p.c},\${a*.06})\`;cx.fill()}
-    })
-    for(let i=0;i<pts.length;i++) for(let j=i+1;j<pts.length;j++){
-      const dx=pts[i].x-pts[j].x,dy=pts[i].y-pts[j].y,d=Math.sqrt(dx*dx+dy*dy)
-      if(d<90){cx.beginPath();cx.strokeStyle=\`rgba(0,245,255,\${.1*(1-d/90)})\`;cx.lineWidth=.5;cx.moveTo(pts[i].x,pts[i].y);cx.lineTo(pts[j].x,pts[j].y);cx.stroke()}
-    }
-    shooters=shooters.filter(s=>s.x<W+100)
-    shooters.forEach(s=>{
-      s.tail.push({x:s.x,y:s.y}); if(s.tail.length>18)s.tail.shift()
-      s.x+=s.vx; s.y+=s.vy; s.life-=.012
-      s.tail.forEach((pt,i)=>{const a=(i/s.tail.length)*.65*s.life;cx.beginPath();cx.arc(pt.x,pt.y,.8,0,Math.PI*2);cx.fillStyle=\`rgba(255,255,255,\${a})\`;cx.fill()})
-      cx.beginPath();cx.arc(s.x,s.y,1.5,0,Math.PI*2);cx.fillStyle=\`rgba(255,255,255,\${s.life})\`;cx.fill()
-    })
-    requestAnimationFrame(draw)
-  })()
-  // 3D tilt on cards
-  document.querySelectorAll('.card').forEach(c=>{
-    c.addEventListener('mousemove',e=>{const r=c.getBoundingClientRect(),dx=(e.clientX-r.left-r.width/2)/(r.width/2),dy=(e.clientY-r.top-r.height/2)/(r.height/2);c.style.transform=\`perspective(400px) rotateY(\${dx*5}deg) rotateX(\${-dy*4}deg) translateZ(4px)\`})
-    c.addEventListener('mouseleave',()=>{c.style.transform=''})
-  })
-})()
+'use strict'
+// ── helpers ──────────────────────────────────────────
+function $(id){ return document.getElementById(id) }
+function fmt(n, d){ if(d===undefined)d=2; return (n!=null && isFinite(n)) ? n.toFixed(d) : '—' }
+function fmtUsd(n){ return (n!=null && isFinite(n)) ? ((n>=0?'+':'-')+'$'+Math.abs(n).toFixed(3)) : '—' }
+function fmtDate(ts){ return ts ? new Date(ts).toLocaleString() : '—' }
+function pnlClass(n){ return n>0?'green':n<0?'red':'' }
+function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') }
 
-// ── PNL STAR PARTICLES ────────────────────────────────────────────────────────
-;(function(){
-  const cv=document.getElementById('pnlStars')
-  const card=document.getElementById('openPnlCard')
-  if(!cv||!card)return
-  const cx=cv.getContext('2d')
-  let stars=[],_pnl=0
-  const rsz=()=>{cv.width=innerWidth;cv.height=innerHeight}
-  rsz();window.addEventListener('resize',rsz)
-
-  function drawStar(x,y,r,rot){
-    cx.beginPath()
-    for(let i=0;i<5;i++){
-      const a=rot+i*4*Math.PI/5-Math.PI/2,ia=rot+(i*4+2)*Math.PI/5-Math.PI/2
-      i===0?cx.moveTo(x+r*Math.cos(a),y+r*Math.sin(a)):cx.lineTo(x+r*Math.cos(a),y+r*Math.sin(a))
-      cx.lineTo(x+r*.4*Math.cos(ia),y+r*.4*Math.sin(ia))
-    }
-    cx.closePath()
+// value flash on change
+function setVal(id, text, numeric, cls){
+  var el = $(id); if(!el) return
+  var prev = parseFloat(el.dataset.v)
+  el.textContent = text
+  el.className = 'val' + (cls ? ' ' + cls : '')
+  if(numeric!=null && isFinite(prev) && Math.abs(numeric-prev) > 1e-9){
+    el.classList.remove('flash-up','flash-down')
+    void el.offsetWidth
+    el.classList.add(numeric>prev ? 'flash-up' : 'flash-down')
   }
+  el.dataset.v = numeric
+}
 
-  function spawn(){
-    if(!_pnl)return
-    const rc=card.getBoundingClientRect()
-    const intensity=Math.min(Math.abs(_pnl)/2,5)   // scale 0–5
-    const up=_pnl>0,col=up?'0,255,136':'255,45,85'
-    const spd=1.5+intensity*.8
-    const n=Math.ceil(1+intensity*.6)
-    for(let i=0;i<n;i++){
-      const x=rc.left+rc.width*.05+Math.random()*rc.width*.9
-      const y=up?rc.bottom-Math.random()*rc.height*.4:rc.top+Math.random()*rc.height*.4
-      stars.push({
-        x,y,
-        vx:(Math.random()-.5)*1.4,
-        vy:up?-(spd+Math.random()*spd*.6):(spd+Math.random()*spd*.6),
-        a:0.9+Math.random()*.1,
-        r:4+Math.random()*(3+intensity*.4),
-        col,rot:Math.random()*Math.PI*2,rs:(Math.random()-.5)*.12,
-        rc        // store card rect at spawn time
-      })
-    }
+// ── sparklines (client-side mid history per asset) ───
+var sparkData = {}
+function sparkPush(asset, mid){
+  if(mid==null) return
+  if(!sparkData[asset]) sparkData[asset] = []
+  var a = sparkData[asset]
+  if(a.length && a[a.length-1] === mid) return
+  a.push(mid)
+  if(a.length > 48) a.shift()
+}
+function sparkSvg(asset, up){
+  var a = sparkData[asset] || []
+  if(a.length < 2) return '<span class="dim" style="font-size:10px">…</span>'
+  var min = Math.min.apply(null,a), max = Math.max.apply(null,a), rng = (max-min) || 1
+  var w = 64, h = 20, pts = []
+  for(var i=0;i<a.length;i++){
+    pts.push((i/(a.length-1)*w).toFixed(1) + ',' + (h - 2 - (a[i]-min)/rng*(h-4)).toFixed(1))
   }
+  var col = up ? '#46D68C' : '#F25C5C'
+  return '<svg width="64" height="20" viewBox="0 0 64 20" aria-hidden="true"><polyline fill="none" stroke="'+col+'" stroke-width="1.5" stroke-linejoin="round" points="'+pts.join(' ')+'"/></svg>'
+}
 
-  setInterval(()=>{if(_pnl!==0)spawn()},320)
+// ── settlement dial ──────────────────────────────────
+var nextSettleMs = null
+var CIRC = 327
+setInterval(function(){
+  if(!nextSettleMs) return
+  var ms = nextSettleMs - Date.now()
+  if(ms <= 0){ nextSettleMs += 3600000; ms += 3600000 }
+  var m = Math.floor(ms/60000), s = Math.floor((ms%60000)/1000)
+  $('dialTime').textContent = String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0')
+  var frac = ms/3600000
+  var prog = $('dialProg')
+  prog.style.strokeDashoffset = (CIRC*(1-frac)).toFixed(1)
+  var minH = (cfg && cfg.minHoursToSettle) || 0.1
+  var blocked = frac < minH
+  prog.classList.toggle('danger', blocked)
+  var st = $('dialStatus')
+  st.className = 'dial-status ' + (blocked ? 'blocked' : 'ok')
+  $('dialStatusTxt').textContent = blocked ? 'ENTRY BLOCKED — SETTLES SOON' : 'ENTRIES OPEN'
+}, 500)
 
-  ;(function loop(){
-    cx.clearRect(0,0,cv.width,cv.height)
-    const rc=card.getBoundingClientRect()
-    stars=stars.filter(s=>s.a>.02)
-    stars.forEach(s=>{
-      s.x+=s.vx;s.y+=s.vy;s.rot+=s.rs
-      // fade faster the further outside the card boundary
-      const outsideY=_pnl>0?Math.max(0,rc.top-s.y):Math.max(0,s.y-rc.bottom)
-      const outsideX=Math.max(0,rc.left-s.x,s.x-rc.right)
-      const outside=Math.max(outsideY,outsideX)
-      s.a-=0.008+outside*0.003
-      cx.save();cx.globalAlpha=Math.max(0,s.a)
-      cx.shadowColor=\`rgba(\${s.col},0.95)\`;cx.shadowBlur=12
-      cx.fillStyle=\`rgba(\${s.col},1)\`
-      drawStar(s.x,s.y,s.r,s.rot);cx.fill()
-      cx.restore()
-    })
-    requestAnimationFrame(loop)
-  })()
+// ── pagination ───────────────────────────────────────
+var PAGE_SIZE = 25
+var _allRates = [], _page = 1
+var _allHist = [], _hpage = 1
 
-  window._pnlStarsUpdate=v=>{_pnl=v}
-})()
+function pagerBtns(container, page, total, cb){
+  var btns = $(container); btns.innerHTML = ''
+  function add(label, pg, disabled, active){
+    var b = document.createElement('button')
+    b.className = 'pbtn' + (active?' active':'')
+    b.textContent = label; b.disabled = disabled
+    b.onclick = function(){ cb(pg) }
+    btns.appendChild(b)
+  }
+  add('‹', page-1, page===1, false)
+  var lo = Math.max(1, page-3), hi = Math.min(total, lo+6)
+  for(var p=lo; p<=hi; p++) add(p, p, false, p===page)
+  add('›', page+1, page===total, false)
+}
 
-// ── PAGINATION STATE ──────────────────────────────────────────────────────────
-const PAGE_SIZE = 25
-let _allRates = [], _page = 1
-let _allHist = [], _hpage = 1
-function renderRatesPage(rates, page) {
+function renderRatesPage(rates, page){
   _allRates = rates; _page = page
-  const total = Math.ceil(rates.length / PAGE_SIZE)
-  const start = (page-1)*PAGE_SIZE, slice = rates.slice(start, start+PAGE_SIZE)
-  const rtb = document.getElementById('ratesTbody')
-  rtb.innerHTML = slice.map(r => {
-    const absApr=Math.abs(r.apr), barW=Math.min(absApr*1.5,64)
-    const color=absApr>=cfg.minFundingApr?(r.apr<0?'#22c55e':'#ef4444'):'#333'
-    const signal=absApr>=cfg.minFundingApr?(r.apr<0?'<span class="green">▲ LONG</span>':'<span class="red">▼ SHORT</span>'):'<span class="dim">—</span>'
-    const vol=r.volume24h>=1e6?'\$'+(r.volume24h/1e6).toFixed(1)+'M':'\$'+(r.volume24h/1e3).toFixed(0)+'K'
-    const aprStr=(r.apr>=0?'+':'')+r.apr.toFixed(1)+'%'
-    const dir=r.apr<0?'Longs paid':'Shorts paid'
-    return '<tr><td><b>'+r.asset+'</b></td>'+
-      '<td><div class="apr-wrap"><div class="apr-bar-bg"><div class="apr-bar" style="width:'+barW+'px;background:'+color+';box-shadow:0 0 5px '+color+'80"></div></div>'+
-      '<span class="'+(r.apr<0?'green':r.apr>0?'red':'')+'" style="font-size:11px">'+aprStr+'</span></div></td>'+
-      '<td class="'+(r.apr<0?'green':'red')+'" style="font-size:11px">'+dir+'</td>'+
-      '<td class="dim" style="font-size:11px">'+vol+'</td>'+
-      '<td>'+signal+'</td></tr>'
-  }).join('')
-  // Update pager
-  const pager = document.getElementById('ratesPager')
-  pager.style.display = rates.length > PAGE_SIZE ? 'flex' : 'none'
-  document.getElementById('pgNum').textContent = page
-  document.getElementById('pgTotal').textContent = total
-  document.getElementById('pgShowing').textContent = (start+1)+'–'+Math.min(start+PAGE_SIZE,rates.length)
-  const btns = document.getElementById('pgBtns')
-  btns.innerHTML = ''
-  const addBtn=(label,pg,disabled,active)=>{const b=document.createElement('button');b.className='pbtn'+(active?' active':'');b.textContent=label;b.disabled=disabled;b.onclick=()=>renderRatesPage(_allRates,pg);btns.appendChild(b)}
-  addBtn('‹',page-1,page===1,false)
-  for(let p=1;p<=total;p++) addBtn(p,p,false,p===page)
-  addBtn('›',page+1,page===total,false)
-}
-
-function renderHistPage(hist, page) {
-  _allHist = hist; _hpage = page
-  const total = Math.ceil(hist.length / PAGE_SIZE)
-  const start = (page-1)*PAGE_SIZE, slice = hist.slice(start, start+PAGE_SIZE)
-  const htb = document.getElementById('histTbody')
-  htb.innerHTML = slice.map(t => {
-    const held = t.closedAt && t.openedAt ? fmt((t.closedAt - t.openedAt)/3600000, 1) + 'h' : '—'
-    const apr  = (t.fundingAPR >= 0 ? '+' : '') + fmt(t.fundingAPR) + '%'
-    return '<tr><td><b>' + t.asset + '</b></td>' +
-      '<td><span class="pill ' + t.side.toLowerCase() + '">' + t.side + '</span></td>' +
-      '<td>' + fmt(t.entryPrice, 4) + '</td>' +
-      '<td>' + fmt(t.exitPrice, 4) + '</td>' +
-      '<td>' + apr + '</td>' +
-      '<td>' + held + '</td>' +
-      '<td class="' + pnlClass(t.pnlUsd) + '">' + fmtUsd(t.pnlUsd) + '</td>' +
-      '<td class="dim">' + (t.reason||'—') + '</td>' +
-      '<td class="dim">' + fmtDate(t.closedAt) + '</td></tr>'
-  }).join('')
-  const pager = document.getElementById('histPager')
-  pager.style.display = hist.length > PAGE_SIZE ? 'flex' : 'none'
-  document.getElementById('hpgNum').textContent = page
-  document.getElementById('hpgTotal').textContent = total
-  document.getElementById('hpgShowing').textContent = (start+1)+'–'+Math.min(start+PAGE_SIZE,hist.length)
-  const btns = document.getElementById('hpgBtns')
-  btns.innerHTML = ''
-  const addBtn=(label,pg,disabled,active)=>{const b=document.createElement('button');b.className='pbtn'+(active?' active':'');b.textContent=label;b.disabled=disabled;b.onclick=()=>renderHistPage(_allHist,pg);btns.appendChild(b)}
-  addBtn('‹',page-1,page===1,false)
-  for(let p=1;p<=total;p++) addBtn(p,p,false,p===page)
-  addBtn('›',page+1,page===total,false)
-}
-
-// ── PNL CHART ─────────────────────────────────────────────────────────────────
-let _pnlChart = null
-
-function buildPnlChart(history) {
-  const sorted = [...history].filter(t => t.closedAt && t.pnlUsd != null).sort((a,b) => a.closedAt - b.closedAt)
-  const emptyEl = document.getElementById('pnlEmpty')
-  const canvasEl = document.getElementById('pnlChart')
-  if (!sorted.length) {
-    emptyEl.style.display = 'flex'; canvasEl.style.display = 'none'
-    return
+  var total = Math.max(1, Math.ceil(rates.length/PAGE_SIZE))
+  var start = (page-1)*PAGE_SIZE, slice = rates.slice(start, start+PAGE_SIZE)
+  var rows = []
+  for(var i=0;i<slice.length;i++){
+    var r = slice[i]
+    var absApr = Math.abs(r.apr), barW = Math.min(absApr/4, 58)
+    var hot = absApr >= (cfg.minFundingApr||60)
+    var col = hot ? (r.apr<0 ? '#46D68C' : '#F25C5C') : '#3A301C'
+    var aprStr = (r.apr>=0?'+':'') + r.apr.toFixed(1) + '%'
+    var vol = r.volume24h>=1e6 ? '$'+(r.volume24h/1e6).toFixed(1)+'M' : '$'+(r.volume24h/1e3).toFixed(0)+'K'
+    var dir = r.apr<0 ? '<span class="green">longs paid</span>' : '<span class="red">shorts paid</span>'
+    var sig = hot ? (r.apr<0 ? '<span class="pill long">LONG</span>' : '<span class="pill short">SHORT</span>') : '<span class="dim">—</span>'
+    rows.push('<tr><td><b>'+esc(r.asset)+'</b></td>'
+      + '<td><span class="apr-wrap"><span class="apr-bg"><span class="apr-fill" style="width:'+barW+'px;background:'+col+'"></span></span>'
+      + '<span class="'+(r.apr<0?'green':'red')+'" style="font-size:11px">'+aprStr+'</span></span></td>'
+      + '<td style="font-size:11px">'+dir+'</td>'
+      + '<td class="dim" style="font-size:11px">'+vol+'</td>'
+      + '<td>'+sig+'</td></tr>')
   }
-  emptyEl.style.display = 'none'; canvasEl.style.display = 'block'
+  $('ratesTbody').innerHTML = rows.join('')
+  $('ratesPager').style.display = rates.length > PAGE_SIZE ? 'flex' : 'none'
+  $('pgNum').textContent = page; $('pgTotal').textContent = total
+  $('pgShowing').textContent = (start+1) + '–' + Math.min(start+PAGE_SIZE, rates.length)
+  pagerBtns('pgBtns', page, total, function(pg){ renderRatesPage(_allRates, pg) })
+}
 
-  // Build cumulative points starting at 0
-  let cum = 0
-  const lineData = [{x: new Date(sorted[0].closedAt - 1), y: 0}]
-  const winPts = [], lossPts = []
-  sorted.forEach(t => {
+function renderHistPage(hist, page){
+  _allHist = hist; _hpage = page
+  var total = Math.max(1, Math.ceil(hist.length/PAGE_SIZE))
+  if(page > total) page = total
+  var start = (page-1)*PAGE_SIZE, slice = hist.slice(start, start+PAGE_SIZE)
+  var rows = []
+  for(var i=0;i<slice.length;i++){
+    var t = slice[i]
+    var held = (t.closedAt && t.openedAt) ? fmt((t.closedAt-t.openedAt)/3600000,1)+'h' : '—'
+    var apr = (t.fundingAPR>=0?'+':'') + fmt(t.fundingAPR,1) + '%'
+    rows.push('<tr><td><b>'+esc(t.asset)+'</b></td>'
+      + '<td><span class="pill '+t.side.toLowerCase()+'">'+t.side+'</span></td>'
+      + '<td>'+fmt(t.entryPrice,4)+'</td>'
+      + '<td>'+fmt(t.exitPrice,4)+'</td>'
+      + '<td>'+apr+'</td>'
+      + '<td>'+held+'</td>'
+      + '<td class="'+pnlClass(t.pnlUsd)+'">'+fmtUsd(t.pnlUsd)+'</td>'
+      + '<td class="reason">'+esc(t.reason||'—')+'</td>'
+      + '<td class="dim" style="font-size:11px">'+fmtDate(t.closedAt)+'</td></tr>')
+  }
+  $('histTbody').innerHTML = rows.join('')
+  $('histPager').style.display = hist.length > PAGE_SIZE ? 'flex' : 'none'
+  $('hpgNum').textContent = page; $('hpgTotal').textContent = total
+  $('hpgShowing').textContent = (start+1) + '–' + Math.min(start+PAGE_SIZE, hist.length)
+  pagerBtns('hpgBtns', page, total, function(pg){ renderHistPage(_allHist, pg) })
+}
+
+// ── pnl chart ────────────────────────────────────────
+var _pnlChart = null
+function buildPnlChart(history){
+  var sorted = history.filter(function(t){ return t.closedAt && t.pnlUsd != null })
+    .sort(function(a,b){ return a.closedAt - b.closedAt })
+  var emptyEl = $('pnlEmpty'), canvasEl = $('pnlChart')
+  if(!sorted.length){ emptyEl.style.display='flex'; canvasEl.style.display='none'; return }
+  emptyEl.style.display='none'; canvasEl.style.display='block'
+
+  var cum = 0
+  var lineData = [{x:new Date(sorted[0].closedAt-1), y:0}]
+  var winPts = [], lossPts = []
+  sorted.forEach(function(t){
     cum += t.pnlUsd
-    const pt = {x: new Date(t.closedAt), y: parseFloat(cum.toFixed(5)), trade: t}
+    var pt = {x:new Date(t.closedAt), y:parseFloat(cum.toFixed(5)), trade:t}
     lineData.push(pt)
     ;(t.pnlUsd >= 0 ? winPts : lossPts).push(pt)
   })
 
-  // Update header total
-  const tot = document.getElementById('pnlChartTotal')
-  tot.textContent = (cum >= 0 ? '+' : '') + '\$' + cum.toFixed(4)
-  tot.style.color = cum >= 0 ? '#16a34a' : '#dc2626'
+  var tot = $('pnlChartTotal')
+  tot.textContent = (cum>=0?'+':'') + '$' + cum.toFixed(4)
+  tot.style.color = cum>=0 ? '#46D68C' : '#F25C5C'
 
-  const ctx = canvasEl.getContext('2d')
+  var ctx = canvasEl.getContext('2d')
+  var grad = ctx.createLinearGradient(0,0,0,250)
+  if(cum>=0){ grad.addColorStop(0,'rgba(70,214,140,0.18)'); grad.addColorStop(1,'rgba(70,214,140,0.01)') }
+  else { grad.addColorStop(0,'rgba(242,92,92,0.18)'); grad.addColorStop(1,'rgba(242,92,92,0.01)') }
 
-  // Gradient fill
-  const grad = ctx.createLinearGradient(0, 0, 0, 260)
-  if (cum >= 0) {
-    grad.addColorStop(0, 'rgba(22,163,74,0.22)')
-    grad.addColorStop(1, 'rgba(22,163,74,0.01)')
-  } else {
-    grad.addColorStop(0, 'rgba(220,38,38,0.22)')
-    grad.addColorStop(1, 'rgba(220,38,38,0.01)')
-  }
-
-  if (_pnlChart) { _pnlChart.destroy(); _pnlChart = null }
-
+  if(_pnlChart){ _pnlChart.destroy(); _pnlChart = null }
   _pnlChart = new Chart(ctx, {
-    data: {
-      datasets: [
-        {
-          type: 'line',
-          label: 'Equity',
-          data: lineData,
-          borderColor: cum >= 0 ? '#16a34a' : '#dc2626',
-          backgroundColor: grad,
-          tension: 0.35,
-          fill: true,
-          pointRadius: 0,
-          pointHoverRadius: 0,
-          borderWidth: 2.5,
-          order: 3
-        },
-        {
-          type: 'scatter',
-          label: 'Win',
-          data: winPts,
-          backgroundColor: 'rgba(22,163,74,0.9)',
-          borderColor: '#fff',
-          borderWidth: 1.5,
-          pointRadius: 5,
-          pointHoverRadius: 8,
-          order: 1
-        },
-        {
-          type: 'scatter',
-          label: 'Loss',
-          data: lossPts,
-          backgroundColor: 'rgba(220,38,38,0.9)',
-          borderColor: '#fff',
-          borderWidth: 1.5,
-          pointRadius: 5,
-          pointHoverRadius: 8,
-          order: 2
-        }
-      ]
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      interaction: { mode: 'nearest', intersect: false, axis: 'x' },
-      plugins: {
-        legend: { display: false },
-        tooltip: {
-          backgroundColor: 'rgba(255,255,255,0.95)',
-          titleColor: '#0f172a',
-          bodyColor: '#334155',
-          borderColor: 'rgba(0,0,0,0.08)',
-          borderWidth: 1,
-          padding: 10,
-          callbacks: {
-            title(items) {
-              const d = items[0].dataset.data[items[0].dataIndex]
-              if (d.trade) return d.trade.asset + ' · ' + d.trade.side
-              return 'Start'
+    data:{ datasets:[
+      { type:'line', label:'Equity', data:lineData,
+        borderColor: cum>=0 ? '#46D68C' : '#F25C5C',
+        backgroundColor: grad, tension:0.3, fill:true,
+        pointRadius:0, pointHoverRadius:0, borderWidth:2, order:3 },
+      { type:'scatter', label:'Win', data:winPts,
+        backgroundColor:'#46D68C', borderColor:'#0C0A07', borderWidth:1.5,
+        pointRadius:4.5, pointHoverRadius:7, order:1 },
+      { type:'scatter', label:'Loss', data:lossPts,
+        backgroundColor:'#F25C5C', borderColor:'#0C0A07', borderWidth:1.5,
+        pointRadius:4.5, pointHoverRadius:7, order:2 }
+    ]},
+    options:{
+      responsive:true, maintainAspectRatio:false,
+      interaction:{mode:'nearest',intersect:false,axis:'x'},
+      plugins:{
+        legend:{display:false},
+        tooltip:{
+          backgroundColor:'#181309', titleColor:'#EDE6D8', bodyColor:'#9A9078',
+          borderColor:'#3A301C', borderWidth:1, padding:10,
+          titleFont:{family:"'IBM Plex Mono',monospace",size:12},
+          bodyFont:{family:"'IBM Plex Mono',monospace",size:11},
+          callbacks:{
+            title:function(items){
+              var d = items[0].dataset.data[items[0].dataIndex]
+              return d.trade ? d.trade.asset + ' · ' + d.trade.side : 'Start'
             },
-            label(item) {
-              const d = item.dataset.data[item.dataIndex]
-              if (!d.trade) return 'PnL: $0.00'
-              const t = d.trade
-              const sign = t.pnlUsd >= 0 ? '+' : ''
+            label:function(item){
+              var d = item.dataset.data[item.dataIndex]
+              if(!d.trade) return 'PnL: $0.00'
+              var t = d.trade, sign = t.pnlUsd>=0?'+':''
               return [
-                'Trade PnL: ' + sign + '\$' + t.pnlUsd.toFixed(4),
-                'Running Total: \$' + item.parsed.y.toFixed(4),
-                'APR: ' + (t.fundingAPR >= 0 ? '+' : '') + (t.fundingAPR||0).toFixed(1) + '%',
-                'Exit: ' + (t.reason || '—'),
+                'trade: ' + sign + '$' + t.pnlUsd.toFixed(4),
+                'total: $' + item.parsed.y.toFixed(4),
+                'apr: ' + (t.fundingAPR>=0?'+':'') + (t.fundingAPR||0).toFixed(1) + '%',
+                'exit: ' + (t.reason||'—'),
                 new Date(t.closedAt).toLocaleString()
               ]
             }
           }
         }
       },
-      scales: {
-        x: {
-          type: 'time',
-          time: { tooltipFormat: 'MMM d HH:mm', displayFormats: { hour: 'MMM d HH:mm', day: 'MMM d', minute: 'HH:mm' } },
-          grid: { color: 'rgba(0,0,0,0.05)', drawBorder: false },
-          ticks: { color: '#64748b', font: { size: 10 }, maxTicksLimit: 8 }
-        },
-        y: {
-          grid: { color: 'rgba(0,0,0,0.05)', drawBorder: false },
-          ticks: { color: '#64748b', font: { size: 10 }, callback: v => '\$' + v.toFixed(3) },
-          afterDataLimits(scale) {
-            const pad = Math.abs(scale.max - scale.min) * 0.1 || 0.01
+      scales:{
+        x:{ type:'time',
+          time:{tooltipFormat:'MMM d HH:mm',displayFormats:{hour:'MMM d HH:mm',day:'MMM d',minute:'HH:mm'}},
+          grid:{color:'rgba(237,230,216,0.05)'},
+          ticks:{color:'#5C543F',font:{family:"'IBM Plex Mono',monospace",size:10},maxTicksLimit:8} },
+        y:{ grid:{color:'rgba(237,230,216,0.05)'},
+          ticks:{color:'#5C543F',font:{family:"'IBM Plex Mono',monospace",size:10},
+            callback:function(v){return '$'+Number(v).toFixed(3)}},
+          afterDataLimits:function(scale){
+            var pad = Math.abs(scale.max-scale.min)*0.1 || 0.01
             scale.max += pad; scale.min -= pad
-          }
-        }
+          } }
       }
     }
   })
 }
 
-// ── DATA REFRESH ──────────────────────────────────────────────────────────────
-let cfg = {}
-let nextSettleMs = null
+// ── refresh ──────────────────────────────────────────
+var cfg = {}
+var DEC = {
+  ENTER:   {cls:'dec-enter', label:'ENTER'},
+  HOLDING: {cls:'dec-hold',  label:'HOLDING'},
+  SKIP:    {cls:'dec-skip',  label:'SKIP'},
+  FAILED:  {cls:'dec-skip',  label:'FAILED'},
+  COOLDOWN:{cls:'dec-cool',  label:'COOLDOWN'},
+  LOW_APR: {cls:'dec-dim',   label:'LOW APR'},
+  LOW_VOL: {cls:'dec-dim',   label:'LOW VOL'},
+  MAX_POS: {cls:'dec-dim',   label:'MAX POS'},
+  PENDING: {cls:'dec-dim',   label:'PENDING'}
+}
 
-function fmt(n, d=2) { return n != null ? n.toFixed(d) : '—' }
-function fmtUsd(n)   { return n != null ? (n>=0?'+':'')+'\$'+Math.abs(n).toFixed(3) : '—' }
-function fmtDate(ts) { return ts ? new Date(ts).toLocaleString() : '—' }
-function pnlClass(n) { return n>0?'green':n<0?'red':'' }
-
-async function refresh() {
-  try {
-    const d = await fetch('/api/status').then(r=>r.json())
+async function refresh(){
+  try{
+    var d = await fetch('/api/status').then(function(r){return r.json()})
     cfg = d.cfg
 
-    document.getElementById('ts').textContent = 'Updated ' + new Date(d.ts).toLocaleTimeString()
-    const mb = document.getElementById('modeBadge')
-    mb.innerHTML = (d.mode==='LIVE'?'<span class="live-dot"></span>':'')+d.mode
-    mb.className = 'badge ' + (d.mode==='LIVE'?'live':'dry')
-    document.getElementById('pauseBadge').style.display = d.paused ? 'inline-block' : 'none'
-    document.getElementById('pauseBtn').textContent = d.paused ? '▶ Resume Bot' : '⏸ Pause Bot'
-    document.getElementById('scanStatus').textContent = d.scanning ? '⟳ Scanning…' : ''
+    $('ts').textContent = 'updated ' + new Date(d.ts).toLocaleTimeString()
 
-    document.getElementById('equity').textContent = '\$' + fmt(d.equity)
-    document.getElementById('avail').textContent  = '\$' + fmt(d.avail)
-    document.getElementById('openCount').textContent = d.openCount + '/' + d.cfg.maxPositions
+    var mb = $('modeBadge')
+    mb.innerHTML = (d.mode==='LIVE' ? '<span class="dot"></span>' : '') + d.mode
+    mb.className = 'chip ' + (d.mode==='LIVE' ? 'live' : 'dry')
+    $('pauseBadge').style.display = d.paused ? 'inline-flex' : 'none'
+    $('pauseBtn').textContent = d.paused ? 'RESUME BOT' : 'PAUSE BOT'
+    $('scanStatus').textContent = d.scanning ? 'scanning…' : ''
+    $('scanSweep').classList.toggle('on', !!d.scanning)
 
-    const openPnl = d.positions.reduce((s,p) => s + (p.pnlUsd||0), 0)
-    const el = document.getElementById('openPnl')
-    el.textContent = fmtUsd(openPnl); el.className = 'val ' + pnlClass(openPnl)
-    if(window._pnlStarsUpdate) window._pnlStarsUpdate(openPnl)
+    // regime chip
+    var rg = $('regimeChip')
+    if(d.regime){
+      rg.style.display = 'inline-flex'
+      var pct = Math.round((d.crowdedRatio||0)*100)
+      if(d.regime==='crowded_long'){ rg.className='chip regime-crowded'; rg.textContent='CROWDED LONG · '+pct+'%' }
+      else { rg.className='chip regime-neutral'; rg.textContent='REGIME NEUTRAL · '+pct+'% LONG-PAID' }
+    }
 
-    const closedPnl = d.totalClosedPnl ?? d.history.reduce((s,t) => s + (t.pnlUsd||0), 0)
-    const cel = document.getElementById('closedPnl')
-    cel.textContent = fmtUsd(closedPnl); cel.className = 'val ' + pnlClass(closedPnl)
-    const wins   = d.totalWins   ?? d.history.filter(t=>(t.pnlUsd||0)>0).length
-    const losses = d.totalLosses ?? d.history.filter(t=>(t.pnlUsd||0)<0).length
-    document.getElementById('winCount').textContent = wins
-    document.getElementById('lossCount').textContent = losses
-    const wDenom = wins + losses
-    document.getElementById('winRate').textContent = wDenom ? Math.round(wins/wDenom*100)+'%' : '—'
+    // instrument strip
+    setVal('equity', '$'+fmt(d.equity), d.equity)
+    setVal('avail', '$'+fmt(d.avail), d.avail)
+    var openPnl = d.positions.reduce(function(s,p){return s+(p.pnlUsd||0)},0)
+    setVal('openPnl', fmtUsd(openPnl), openPnl, openPnl>0?'pos':openPnl<0?'neg':'')
+    var closedPnl = d.totalClosedPnl != null ? d.totalClosedPnl : d.history.reduce(function(s,t){return s+(t.pnlUsd||0)},0)
+    setVal('closedPnl', fmtUsd(closedPnl), closedPnl, closedPnl>0?'pos':closedPnl<0?'neg':'')
+    var wins = d.totalWins||0, losses = d.totalLosses||0
+    $('winCount').textContent = wins; $('lossCount').textContent = losses
+    $('winRate').textContent = (wins+losses) ? Math.round(wins/(wins+losses)*100)+'%' : '—'
+    setVal('openCount', d.openCount + '/' + d.cfg.maxPositions, d.openCount)
+    setVal('totalTrades', String(d.totalTrades != null ? d.totalTrades : d.history.length), d.totalTrades)
 
-    document.getElementById('totalTrades').textContent = d.totalTrades ?? d.history.length
+    // dial sync
+    nextSettleMs = Date.now() + d.hoursToSettle*3600000
 
-    nextSettleMs = Date.now() + d.hoursToSettle * 3600000
-    const canEnter = d.hoursToSettle >= d.cfg.minHoursToSettle
-    const sEl = document.getElementById('settleStatus')
-    sEl.textContent = canEnter ? '✓ Entries allowed' : '✗ Too close to settle'
-    sEl.style.color  = canEnter ? '#22c55e' : '#eab308'
+    // account
+    var w = d.wallet || ''
+    $('acctWallet').textContent = w ? w.slice(0,6)+'…'+w.slice(-4) : '—'
+    $('acctWallet').title = w
+    $('acctMode').textContent = d.mode
+    if(d.startedAt){
+      var up = Date.now() - d.startedAt
+      var uh = Math.floor(up/3600000), um = Math.floor((up%3600000)/60000)
+      $('acctUptime').textContent = uh > 0 ? uh+'h '+um+'m' : um+'m'
+    }
+    $('acctScan').textContent = Math.round(d.cfg.scanIntervalMs/1000) + 's'
 
-    document.getElementById('cfgApr').value     = d.cfg.minFundingApr
-    document.getElementById('cfgSettle').value      = d.cfg.minHoursToSettle
-    document.getElementById('cfgMaxSettle').value   = d.cfg.maxHoursToSettle ?? 1.0
-    document.getElementById('cfgExitSettle').value  = d.cfg.exitAfterSettleMins ?? 15
-    document.getElementById('cfgVol').value     = d.cfg.maxVolatilityPct
-    document.getElementById('cfgTrend').value   = d.cfg.trendFilter ? 'true' : 'false'
-    document.getElementById('cfgPos').value         = d.cfg.positionUsd
-    document.getElementById('cfgMaxPos2').value     = d.cfg.maxPositionUsd ?? 60
-    document.getElementById('cfgDynSize').value     = d.cfg.dynamicSizing ? 'true' : 'false'
-    document.getElementById('cfgSL').value     = d.cfg.stopLossPct
-    document.getElementById('cfgTS').value         = d.cfg.trailingStopPct
-    document.getElementById('cfgHighAprThr').value     = d.cfg.highAprThreshold ?? 300
-    document.getElementById('cfgTSHigh').value         = d.cfg.trailingStopHighApr ?? 5
-    document.getElementById('cfgHold').value           = d.cfg.maxHoldHours
-    document.getElementById('cfgMaxPos').value         = d.cfg.maxPositions
-    document.getElementById('cfgMaxSettle2').value     = d.cfg.maxSettlements ?? 1
-    document.getElementById('cfgMaxSettleHigh').value  = d.cfg.highAprMaxSettlements ?? 3
-    document.getElementById('cfgAprTrend').value       = d.cfg.aprTrendFilter ? 'true' : 'false'
-    document.getElementById('cfgRegimeCooldown').value = d.cfg.regimeFlipCooldownMins ?? 10
+    // config inputs (don't clobber while panel open)
+    if(!$('cfgPanel').classList.contains('open')){
+      $('cfgApr').value = d.cfg.minFundingApr
+      $('cfgSettle').value = d.cfg.minHoursToSettle
+      $('cfgMaxSettle').value = d.cfg.maxHoursToSettle != null ? d.cfg.maxHoursToSettle : 1.0
+      $('cfgExitSettle').value = d.cfg.exitAfterSettleMins != null ? d.cfg.exitAfterSettleMins : 3
+      $('cfgVol').value = d.cfg.maxVolatilityPct
+      $('cfgTrend').value = d.cfg.trendFilter ? 'true' : 'false'
+      $('cfgPos').value = d.cfg.positionUsd
+      $('cfgMaxPos2').value = d.cfg.maxPositionUsd != null ? d.cfg.maxPositionUsd : 60
+      $('cfgDynSize').value = d.cfg.dynamicSizing ? 'true' : 'false'
+      $('cfgSL').value = d.cfg.stopLossPct
+      $('cfgTS').value = d.cfg.trailingStopPct
+      $('cfgHighAprThr').value = d.cfg.highAprThreshold != null ? d.cfg.highAprThreshold : 300
+      $('cfgTSHigh').value = d.cfg.trailingStopHighApr != null ? d.cfg.trailingStopHighApr : 5
+      $('cfgHold').value = d.cfg.maxHoldHours
+      $('cfgMaxPos').value = d.cfg.maxPositions
+      $('cfgMaxSettle2').value = d.cfg.maxSettlements != null ? d.cfg.maxSettlements : 1
+      $('cfgMaxSettleHigh').value = d.cfg.highAprMaxSettlements != null ? d.cfg.highAprMaxSettlements : 3
+      $('cfgAprTrend').value = d.cfg.aprTrendFilter ? 'true' : 'false'
+      $('cfgRegimeCooldown').value = d.cfg.regimeFlipCooldownMins != null ? d.cfg.regimeFlipCooldownMins : 10
+    }
 
-    // Positions
-    const ptb = document.getElementById('posTbody')
-    const pc = document.getElementById('posCount')
+    // positions
+    d.positions.forEach(function(p){ sparkPush(p.asset, p.midPrice) })
+    var pc = $('posCount')
     pc.textContent = d.positions.length ? d.positions.length + ' open' : ''
     pc.style.display = d.positions.length ? 'inline-block' : 'none'
-    if (!d.positions.length) {
-      ptb.innerHTML = '<tr><td colspan="9" class="empty dim">No open positions — bot scanning every ' + Math.round(d.cfg.scanIntervalMs/60000) + ' min</td></tr>'
+    if(!d.positions.length){
+      $('posTbody').innerHTML = '<tr><td colspan="10" class="empty">No open positions — scanner runs every ' + Math.round(d.cfg.scanIntervalMs/60000) + ' min</td></tr>'
     } else {
-      ptb.innerHTML = d.positions.map(p => {
-        const adv = p.adversePct != null ? fmt(p.adversePct) + '%' : '—'
-        const advC = p.adversePct > 1 ? 'red' : p.adversePct > 0.5 ? 'yellow' : 'green'
-        const held = fmt(p.heldHours, 1) + 'h'
-        const apr  = (p.fundingAPR >= 0 ? '+' : '') + fmt(p.fundingAPR) + '%'
-        return '<tr><td><b>' + p.asset + '</b></td>' +
-          '<td><span class="pill ' + p.side.toLowerCase() + '">' + p.side + '</span></td>' +
-          '<td>' + fmt(p.entryPrice, 4) + '</td>' +
-          '<td>' + fmt(p.midPrice, 4) + '</td>' +
-          '<td class="' + (p.fundingAPR < 0 ? 'green' : 'red') + '">' + apr + '</td>' +
-          '<td>' + held + '</td>' +
-          '<td class="' + advC + '">' + adv + '</td>' +
-          '<td class="' + pnlClass(p.pnlUsd) + '">' + fmtUsd(p.pnlUsd) + '</td>' +
-          '<td><button class="btn btn-close" data-asset="' + p.asset + '">Close</button></td></tr>'
+      $('posTbody').innerHTML = d.positions.map(function(p){
+        var adv = p.adversePct != null ? fmt(p.adversePct)+'%' : '—'
+        var advFrac = p.adversePct != null ? Math.min(1, Math.max(0, p.adversePct/(cfg.stopLossPct||1.5))) : 0
+        var advCol = advFrac > 0.66 ? '#F25C5C' : advFrac > 0.4 ? '#E8C547' : '#46D68C'
+        var held = fmt(p.heldHours,1)+'h'
+        var apr = (p.fundingAPR>=0?'+':'') + fmt(p.fundingAPR,1) + '%'
+        return '<tr><td><b>'+esc(p.asset)+'</b></td>'
+          + '<td><span class="pill '+p.side.toLowerCase()+'">'+p.side+'</span></td>'
+          + '<td>'+fmt(p.entryPrice,4)+'</td>'
+          + '<td>'+fmt(p.midPrice,4)+'</td>'
+          + '<td>'+sparkSvg(p.asset, (p.pnlUsd||0) >= 0)+'</td>'
+          + '<td class="'+(p.fundingAPR<0?'green':'red')+'">'+apr+'</td>'
+          + '<td>'+held+'</td>'
+          + '<td><span class="meter"><span class="meter-bg"><span class="meter-fill" style="width:'+(advFrac*52).toFixed(0)+'px;background:'+advCol+'"></span></span>'
+          + '<span style="font-size:11px;color:'+advCol+'">'+adv+'</span></span></td>'
+          + '<td class="'+pnlClass(p.pnlUsd)+'">'+fmtUsd(p.pnlUsd)+'</td>'
+          + '<td><button class="btn-close" data-asset="'+esc(p.asset)+'">CLOSE</button></td></tr>'
       }).join('')
     }
 
-    // Scanner log
-    if (d.scanDecisions && d.scanDecisions.length) {
-      const enters   = d.scanDecisions.filter(x => x.decision === 'ENTER').length
-      const holdings = d.scanDecisions.filter(x => x.decision === 'HOLDING').length
-      const skips    = d.scanDecisions.filter(x => !['ENTER','HOLDING'].includes(x.decision)).length
-      document.getElementById('scannerSummary').textContent =
-        d.scanDecisions.length + ' assets · ' + enters + ' entered · ' + skips + ' skipped' + (holdings ? ' · ' + holdings + ' held' : '')
-      if (d.lastScanAt) document.getElementById('scannerTs').textContent = 'Last scan: ' + new Date(d.lastScanAt).toLocaleTimeString()
-      const DEC = {
-        ENTER:   { cls: 'green',  label: '▲ ENTER'   },
-        HOLDING: { cls: 'yellow', label: '◈ HOLDING'  },
-        SKIP:    { cls: 'red',    label: '✕ SKIP'     },
-        LOW_APR: { cls: 'dim',    label: '~ LOW APR'  },
-        LOW_VOL: { cls: 'dim',    label: '~ LOW VOL'  },
-        COOLDOWN:{ cls: 'yellow', label: '◷ COOLDOWN' },
-        MAX_POS: { cls: 'dim',    label: '— MAX POS'  },
-        FAILED:  { cls: 'red',    label: '✕ FAILED'   },
-        PENDING: { cls: 'dim',    label: '? PENDING'  },
-      }
-      document.getElementById('scannerTbody').innerHTML = d.scanDecisions.map(s => {
-        const aprStr = (s.apr >= 0 ? '+' : '') + s.apr.toFixed(1) + '%'
-        const aprCls = s.apr < 0 ? 'green' : s.apr > 0 ? 'red' : ''
-        const side = s.isBuy
-          ? '<span class="pill long">LONG</span>'
-          : '<span class="pill short">SHORT</span>'
-        const vol = s.vol >= 1e6 ? '\$'+(s.vol/1e6).toFixed(1)+'M' : '\$'+(s.vol/1e3).toFixed(0)+'K'
-        const dec = DEC[s.decision] || { cls: 'dim', label: s.decision }
-        return '<tr>' +
-          '<td><b>' + s.asset + '</b></td>' +
-          '<td>' + side + '</td>' +
-          '<td class="' + aprCls + '" style="font-size:11px">' + aprStr + '</td>' +
-          '<td class="dim" style="font-size:11px">' + vol + '</td>' +
-          '<td class="' + dec.cls + '" style="font-size:11px;font-weight:600;letter-spacing:.5px">' + dec.label + '</td>' +
-          '<td style="font-size:11px;color:#8090b0">' + (s.reason || '—') + '</td>' +
-          '</tr>'
+    // scanner
+    if(d.scanDecisions && d.scanDecisions.length){
+      var enters = 0, holding = 0, skips = 0
+      d.scanDecisions.forEach(function(x){
+        if(x.decision==='ENTER') enters++
+        else if(x.decision==='HOLDING') holding++
+        else skips++
+      })
+      $('scannerSummary').textContent = d.scanDecisions.length+' assets · '+enters+' entered · '+skips+' skipped'+(holding?' · '+holding+' held':'')
+      if(d.lastScanAt) $('scannerTs').textContent = 'last scan ' + new Date(d.lastScanAt).toLocaleTimeString()
+      $('scannerTbody').innerHTML = d.scanDecisions.map(function(s){
+        var aprStr = (s.apr>=0?'+':'') + s.apr.toFixed(1) + '%'
+        var side = s.isBuy ? '<span class="pill long">LONG</span>' : '<span class="pill short">SHORT</span>'
+        var vol = s.vol>=1e6 ? '$'+(s.vol/1e6).toFixed(1)+'M' : '$'+(s.vol/1e3).toFixed(0)+'K'
+        var dec = DEC[s.decision] || {cls:'dec-dim', label:s.decision}
+        return '<tr><td><b>'+esc(s.asset)+'</b></td>'
+          + '<td>'+side+'</td>'
+          + '<td class="'+(s.apr<0?'green':'red')+'" style="font-size:11px">'+aprStr+'</td>'
+          + '<td class="dim" style="font-size:11px">'+vol+'</td>'
+          + '<td><span class="badge-dec '+dec.cls+'">'+dec.label+'</span></td>'
+          + '<td class="reason">'+esc(s.reason||'—')+'</td></tr>'
       }).join('')
     }
 
-    // Rates (paginated)
-    const rc = document.getElementById('rateCount')
-    rc.textContent = d.rates.length ? d.rates.length + ' assets' : ''
+    // rates
+    var rc = $('rateCount')
+    rc.textContent = d.rates.length ? d.rates.length+' assets' : ''
     rc.style.display = d.rates.length ? 'inline-block' : 'none'
-    if (!d.rates.length) {
-      document.getElementById('ratesTbody').innerHTML = '<tr><td colspan="5" class="empty dim">Rates load after first scan</td></tr>'
-      document.getElementById('ratesPager').style.display = 'none'
-    } else {
-      renderRatesPage(d.rates, 1)
-    }
+    if(d.rates.length) renderRatesPage(d.rates, Math.min(_page, Math.ceil(d.rates.length/PAGE_SIZE)))
 
-    // PnL Chart
+    // chart
     buildPnlChart(d.history)
 
-    // History (paginated)
-    const hc = document.getElementById('histCount')
-    const totalH = d.totalTrades ?? d.history.length
-    hc.textContent = totalH ? totalH + ' trades' : ''
+    // history
+    var hc = $('histCount')
+    var totalH = d.totalTrades != null ? d.totalTrades : d.history.length
+    hc.textContent = totalH ? totalH+' trades' : ''
     hc.style.display = totalH ? 'inline-block' : 'none'
-    if (!d.history.length) {
-      document.getElementById('histTbody').innerHTML = '<tr><td colspan="9" class="empty dim">No closed trades yet</td></tr>'
-      document.getElementById('histPager').style.display = 'none'
-    } else {
-      renderHistPage(d.history, _hpage)
-    }
-  } catch(e) {
-    document.getElementById('ts').textContent = 'Error: ' + e.message
+    if(d.history.length) renderHistPage(d.history, _hpage)
+  } catch(e){
+    $('ts').textContent = 'error: ' + e.message
   }
 }
 
-document.addEventListener('click', async function(e) {
-  const btn = e.target.closest('[data-asset]')
-  if (!btn) return
-  const asset = btn.dataset.asset
-  if (!confirm('Close ' + asset + ' position now?')) return
-  const r = await fetch('/api/close/' + asset, { method: 'POST' }).then(x=>x.json())
-  if (r.error) alert('Error: ' + r.error)
-  else refresh()
+// ── actions ──────────────────────────────────────────
+document.addEventListener('click', async function(e){
+  var btn = e.target.closest('[data-asset]')
+  if(!btn) return
+  var asset = btn.dataset.asset
+  if(!confirm('Close ' + asset + ' position now?')) return
+  btn.disabled = true; btn.textContent = '…'
+  var r = await fetch('/api/close/' + encodeURIComponent(asset), {method:'POST'}).then(function(x){return x.json()})
+  if(r.error) alert('Error: ' + r.error)
+  refresh()
 })
 
-async function triggerScan() {
-  document.getElementById('scanStatus').textContent = '⟳ Triggering scan…'
-  await fetch('/api/scan', { method: 'POST' })
+async function triggerScan(){
+  $('scanStatus').textContent = 'triggering…'
+  $('scanSweep').classList.add('on')
+  await fetch('/api/scan', {method:'POST'})
+  setTimeout(refresh, 1200)
+}
+
+async function togglePause(){
+  await fetch('/api/pause', {method:'POST'})
   refresh()
 }
 
-async function togglePause() {
-  await fetch('/api/pause', { method: 'POST' })
-  refresh()
+function toggleCfg(){
+  var p = $('cfgPanel')
+  p.classList.toggle('open')
+  $('cfgToggle').setAttribute('aria-expanded', p.classList.contains('open') ? 'true' : 'false')
 }
 
-function toggleCfg() {
-  document.getElementById('cfgPanel').classList.toggle('open')
-}
-
-async function saveConfig() {
-  const body = {
-    minFundingApr:        parseFloat(document.getElementById('cfgApr').value),
-    minHoursToSettle:     parseFloat(document.getElementById('cfgSettle').value),
-    maxHoursToSettle:     parseFloat(document.getElementById('cfgMaxSettle').value),
-    exitAfterSettleMins:  parseFloat(document.getElementById('cfgExitSettle').value),
-    maxVolatilityPct:   parseFloat(document.getElementById('cfgVol').value),
-    trendFilter:        document.getElementById('cfgTrend').value === 'true',
-    positionUsd:      parseFloat(document.getElementById('cfgPos').value),
-    maxPositionUsd:   parseFloat(document.getElementById('cfgMaxPos2').value),
-    dynamicSizing:    document.getElementById('cfgDynSize').value === 'true',
-    stopLossPct:     parseFloat(document.getElementById('cfgSL').value),
-    trailingStopPct:        parseFloat(document.getElementById('cfgTS').value),
-    highAprThreshold:       parseFloat(document.getElementById('cfgHighAprThr').value),
-    trailingStopHighApr:    parseFloat(document.getElementById('cfgTSHigh').value),
-    maxHoldHours:             parseFloat(document.getElementById('cfgHold').value),
-    maxPositions:             parseInt(document.getElementById('cfgMaxPos').value),
-    maxSettlements:           parseInt(document.getElementById('cfgMaxSettle2').value),
-    highAprMaxSettlements:    parseInt(document.getElementById('cfgMaxSettleHigh').value),
-    aprTrendFilter:           document.getElementById('cfgAprTrend').value === 'true',
-    regimeFlipCooldownMins:   parseFloat(document.getElementById('cfgRegimeCooldown').value),
+async function saveConfig(){
+  var body = {
+    minFundingApr:        parseFloat($('cfgApr').value),
+    minHoursToSettle:     parseFloat($('cfgSettle').value),
+    maxHoursToSettle:     parseFloat($('cfgMaxSettle').value),
+    exitAfterSettleMins:  parseFloat($('cfgExitSettle').value),
+    maxVolatilityPct:     parseFloat($('cfgVol').value),
+    trendFilter:          $('cfgTrend').value === 'true',
+    positionUsd:          parseFloat($('cfgPos').value),
+    maxPositionUsd:       parseFloat($('cfgMaxPos2').value),
+    dynamicSizing:        $('cfgDynSize').value === 'true',
+    stopLossPct:          parseFloat($('cfgSL').value),
+    trailingStopPct:      parseFloat($('cfgTS').value),
+    highAprThreshold:     parseFloat($('cfgHighAprThr').value),
+    trailingStopHighApr:  parseFloat($('cfgTSHigh').value),
+    maxHoldHours:         parseFloat($('cfgHold').value),
+    maxPositions:         parseInt($('cfgMaxPos').value),
+    maxSettlements:       parseInt($('cfgMaxSettle2').value),
+    highAprMaxSettlements:parseInt($('cfgMaxSettleHigh').value),
+    aprTrendFilter:       $('cfgAprTrend').value === 'true',
+    regimeFlipCooldownMins: parseFloat($('cfgRegimeCooldown').value)
   }
-  await fetch('/api/config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) })
-  document.getElementById('cfgPanel').classList.remove('open')
+  await fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)})
+  toggleCfg()
   refresh()
 }
-
-setInterval(() => {
-  if (!nextSettleMs) return
-  const ms=Math.max(0,nextSettleMs-Date.now())
-  const h=Math.floor(ms/3600000),m=Math.floor((ms%3600000)/60000),s=Math.floor((ms%60000)/1000)
-  const str=h>0?h+'h '+String(m).padStart(2,'0')+'m':String(m).padStart(2,'0')+'m '+String(s).padStart(2,'0')+'s'
-  const el=document.getElementById('settleCountdown'); if(el)el.textContent=str
-}, 1000)
 
 refresh()
 setInterval(refresh, 15000)
@@ -1385,12 +1498,8 @@ createServer(async (req, res) => {
   if (url === '/health') { res.writeHead(200); res.end('ok'); return }
 
   if (method === 'GET' && url === '/') {
-    res.writeHead(200, { 'Content-Type': 'text/html' })
-    try {
-      const src = readFileSync(fileURLToPath(import.meta.url), 'utf8')
-      const m = src.match(/const HTML = `([\s\S]*?)`\n\/\/ ── HTTP/)
-      return res.end(m ? m[1] : HTML)
-    } catch { return res.end(HTML) }
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+    return res.end(HTML)
   }
 
   if (method === 'GET' && url === '/api/status') {
