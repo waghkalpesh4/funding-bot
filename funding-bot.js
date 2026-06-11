@@ -256,6 +256,7 @@ async function scan() {
   if (scanning) { log('Scan already running, skipping'); return }
   if (paused)   { log('Bot paused, skipping scan'); return }
   scanning = true
+  try {
   const state = loadState()
   const now   = Date.now()
 
@@ -368,12 +369,19 @@ async function scan() {
   const equity = cachedBal?.equity ?? '?'
   log(`Scan complete | equity $${equity} | open: ${Object.keys(state.positions).length}/${CFG.maxPositions} | next entry-scan in ${CFG.scanIntervalMs/1000}s`)
   log('---')
-  scanning = false
+  } catch (e) {
+    log('Scan error:', e.message)
+  } finally {
+    scanning = false
+  }
 }
 
 function scheduleScan() {
   if (scanTimer) clearTimeout(scanTimer)
-  scanTimer = setTimeout(async () => { await scan(); scheduleScan() }, CFG.scanIntervalMs)
+  scanTimer = setTimeout(async () => {
+    try { await scan() } catch (e) { log('Scan unhandled error:', e.message) }
+    scheduleScan()
+  }, CFG.scanIntervalMs)
 }
 
 // Refresh mid prices every 5s + enforce SL + price-change spike exit
