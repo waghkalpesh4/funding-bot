@@ -85,6 +85,8 @@ let crowdedLongRatio  = 0.5        // % of liquid assets with positive funding
 let prevRegime        = 'neutral'  // previous regime value for flip detection
 let regimeFlipTime    = 0          // timestamp when regime last flipped crowded_long → neutral
 let rateHistory       = {}         // { asset: [{apr, ts}] } — rolling 6-scan window
+let scanDecisions     = []         // per-asset decisions from last scan
+let lastScanAt        = null       // timestamp scan started
 
 // ── PERSISTENT STATE ──────────────────────────────────────────────────────────
 function loadState() {
@@ -259,6 +261,7 @@ async function scan() {
   try {
   const state = loadState()
   const now   = Date.now()
+  lastScanAt  = now
 
   // Bulk fetch all funding rates (single API call)
   log('Fetching all funding rates...')
@@ -270,6 +273,23 @@ async function scan() {
     if (rateHistory[r.asset].length > 6) rateHistory[r.asset].shift()
   }
   log(`Loaded ${allRates.length} assets`)
+
+  // Build decision map for dashboard scanner — all "watchlist" assets (APR >= half threshold or already open)
+  const decMap = new Map()
+  const watchlistFilter = r => Math.abs(r.apr) >= CFG.minFundingApr * 0.5 && r.volume24h >= 500_000
+  for (const r of allRates.filter(watchlistFilter)) {
+    let decision = 'PENDING', reason = ''
+    if (state.positions[r.asset]) {
+      decision = 'HOLDING'; reason = 'Position open'
+    } else if (state.cooldowns[r.asset] && state.cooldowns[r.asset] > now) {
+      decision = 'COOLDOWN'; reason = `${Math.ceil((state.cooldowns[r.asset] - now) / 60000)}min cooldown`
+    } else if (Math.abs(r.apr) < CFG.minFundingApr) {
+      decision = 'LOW_APR'; reason = `${Math.abs(r.apr).toFixed(0)}% < ${CFG.minFundingApr}% threshold`
+    } else if (r.volume24h < 1_000_000) {
+      decision = 'LOW_VOL'; reason = `$${(r.volume24h / 1e6).toFixed(1)}M vol < $1M min`
+    }
+    decMap.set(r.asset, { asset: r.asset, apr: r.apr, vol: r.volume24h, isBuy: r.apr < 0, decision, reason })
+  }
 
   // Detect funding regime: if ≥65% of liquid assets have positive funding → market crowded long
   // Going LONG (negative funding) in crowded-long market = fighting macro + no yield edge
@@ -288,12 +308,16 @@ async function scan() {
   // Scan for new entries
   const openCount = Object.keys(state.positions).length
   const hoursLeft = hoursUntilNextSettlement()
+  const _dec = a => decMap.get(a)  // shorthand for decision lookup
+
   if (openCount < CFG.maxPositions) {
     const maxHrs = CFG.maxHoursToSettle ?? 8
     if (hoursLeft < CFG.minHoursToSettle) {
       log(`Skipping new entries — only ${hoursLeft.toFixed(2)}h to settlement (min ${CFG.minHoursToSettle}h required)`)
+      for (const [, d] of decMap) if (d.decision === 'PENDING') { d.decision = 'SKIP'; d.reason = `${hoursLeft.toFixed(2)}h to settle (min ${CFG.minHoursToSettle}h)` }
     } else if (hoursLeft > maxHrs) {
       log(`Skipping new entries — ${hoursLeft.toFixed(2)}h to settlement (entry window: ${CFG.minHoursToSettle}–${maxHrs}h before settlement)`)
+      for (const [, d] of decMap) if (d.decision === 'PENDING') { d.decision = 'SKIP'; d.reason = `${hoursLeft.toFixed(2)}h to settle (outside entry window)` }
     } else {
     const opps = allRates
       .filter(r => !state.positions[r.asset])
@@ -304,12 +328,16 @@ async function scan() {
     log(`Opportunities (${hoursLeft.toFixed(1)}h to settlement): ${opps.slice(0,5).map(o=>`${o.asset}:${o.apr.toFixed(1)}%`).join(', ') || 'none'}`)
 
     for (const opp of opps) {
-      if (Object.keys(state.positions).length >= CFG.maxPositions) break
+      if (Object.keys(state.positions).length >= CFG.maxPositions) {
+        for (const rem of opps) { const d = _dec(rem.asset); if (d?.decision === 'PENDING') { d.decision = 'MAX_POS'; d.reason = 'Max positions reached' } }
+        break
+      }
       const isBuy  = opp.apr < 0
 
       // Regime gate: in crowded-long market, skip going LONG on alts
       if (isBuy && btcFundingRegime === 'crowded_long') {
         log(`SKIP ${opp.asset} LONG — regime block: ${(crowdedLongRatio*100).toFixed(0)}% crowded long market, alt longs high risk`)
+        const d = _dec(opp.asset); if (d) { d.decision = 'SKIP'; d.reason = `Regime: ${(crowdedLongRatio*100).toFixed(0)}% crowded long market` }
         continue
       }
 
@@ -318,6 +346,7 @@ async function scan() {
       if (isBuy && regimeFlipTime > 0 && (now - regimeFlipTime) < regimeCooldownMs) {
         const minsLeft = ((regimeCooldownMs - (now - regimeFlipTime)) / 60000).toFixed(1)
         log(`SKIP ${opp.asset} LONG — regime flip cooldown: ${minsLeft}min remaining`)
+        const d = _dec(opp.asset); if (d) { d.decision = 'SKIP'; d.reason = `Regime flip cooldown: ${minsLeft}min remaining` }
         continue
       }
 
@@ -331,16 +360,22 @@ async function scan() {
           const pctOff  = peak > 0 ? (peak - latest) / peak * 100 : 0
           if (pctOff > 20) {
             log(`SKIP ${opp.asset} — APR trend falling: ${peak.toFixed(0)}% peak → ${latest.toFixed(0)}% now (${pctOff.toFixed(0)}% off peak)`)
+            const d = _dec(opp.asset); if (d) { d.decision = 'SKIP'; d.reason = `APR trend falling: ${peak.toFixed(0)}%→${latest.toFixed(0)}% (${pctOff.toFixed(0)}% off peak)` }
             continue
           }
         }
       }
 
       const filter = await passesEntryFilters(opp.asset, isBuy, Math.abs(opp.apr))
-      if (!filter.ok) { log(`SKIP ${opp.asset} — ${filter.reason}`); continue }
+      if (!filter.ok) {
+        log(`SKIP ${opp.asset} — ${filter.reason}`)
+        const d = _dec(opp.asset); if (d) { d.decision = 'SKIP'; d.reason = filter.reason }
+        continue
+      }
       const result = await openPosition(opp.asset, isBuy, opp.apr)
       const tNow = Date.now()
       if (!result || result.failed) {
+        const d = _dec(opp.asset); if (d) { d.decision = 'FAILED'; d.reason = result?.error || 'Order failed' }
         await lockState(async () => {
           const s = loadState()
           s.cooldowns[opp.asset] = tNow + 30 * 60 * 1000
@@ -351,6 +386,7 @@ async function scan() {
       const mid = await hl.getMidPrice(opp.asset)
       const settlesAt = tNow + hoursUntilNextSettlement() * 3600000
       const entryPrice = parseFloat(result?.filled?.avgPx ?? result?.avgPrice ?? 0) || mid
+      const d = _dec(opp.asset); if (d) { d.decision = 'ENTER'; d.reason = `${isBuy?'LONG':'SHORT'} @ $${entryPrice.toFixed(4)} | $${result.sizeUsd ?? CFG.positionUsd}` }
       await lockState(async () => {
         const s = loadState()
         s.positions[opp.asset] = {
@@ -363,7 +399,16 @@ async function scan() {
       })
     }
     } // end else (enough time to settle)
+  } else {
+    for (const [, d] of decMap) if (d.decision === 'PENDING') { d.decision = 'MAX_POS'; d.reason = 'Max positions reached' }
   }
+
+  // Commit scan decisions (sort by abs APR desc, ENTERs first)
+  scanDecisions = [...decMap.values()].sort((a, b) => {
+    if (a.decision === 'ENTER' && b.decision !== 'ENTER') return -1
+    if (b.decision === 'ENTER' && a.decision !== 'ENTER') return 1
+    return Math.abs(b.apr) - Math.abs(a.apr)
+  })
 
   cachedBal = await hl.getAccountState(identity.hl.address).catch(() => null)
   const equity = cachedBal?.equity ?? '?'
@@ -518,7 +563,7 @@ function apiStatus() {
   return { equity, avail, positions, openCount: positions.length, history: state.history.slice(0, 50),
     totalTrades, totalWins, totalLosses, totalClosedPnl,
     rates, paused, scanning, cfg: CFG, mode: CFG.dryRun ? 'DRY RUN' : 'LIVE',
-    wallet: identity.hl.address, hoursToSettle, ts: new Date().toISOString() }
+    wallet: identity.hl.address, hoursToSettle, scanDecisions, lastScanAt, ts: new Date().toISOString() }
 }
 
 async function apiClose(asset) {
@@ -716,6 +761,19 @@ tr:hover .red{text-shadow:0 0 8px rgba(255,45,85,0.4)}
       <div class="cfg-field"><label>Regime Flip Cooldown (min)</label><input id="cfgRegimeCooldown" type="number" step="1"></div>
       <button class="btn btn-save" onclick="saveConfig()">Save</button>
     </div>
+  </div>
+
+  <!-- Scanner Log -->
+  <div class="section">
+    <div class="section-head" style="display:flex;align-items:center;gap:8px">
+      <span>Scanner Log</span>
+      <span id="scannerSummary" style="font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--muted);background:rgba(0,245,255,0.04);border:1px solid rgba(0,245,255,0.12);padding:1px 9px;border-radius:20px"></span>
+      <span id="scannerTs" style="margin-left:auto;font-size:10px;color:var(--muted)">Waiting for first scan…</span>
+    </div>
+    <table>
+      <thead><tr><th>Asset</th><th>Side</th><th style="width:120px">APR</th><th>Volume 24h</th><th style="width:130px">Decision</th><th>Reason</th></tr></thead>
+      <tbody id="scannerTbody" class="spaced-rows"><tr><td colspan="6" class="empty dim">Scan results appear here after first scan</td></tr></tbody>
+    </table>
   </div>
 
   <!-- Open Positions -->
@@ -1175,6 +1233,44 @@ async function refresh() {
           '<td class="' + advC + '">' + adv + '</td>' +
           '<td class="' + pnlClass(p.pnlUsd) + '">' + fmtUsd(p.pnlUsd) + '</td>' +
           '<td><button class="btn btn-close" data-asset="' + p.asset + '">Close</button></td></tr>'
+      }).join('')
+    }
+
+    // Scanner log
+    if (d.scanDecisions && d.scanDecisions.length) {
+      const enters   = d.scanDecisions.filter(x => x.decision === 'ENTER').length
+      const holdings = d.scanDecisions.filter(x => x.decision === 'HOLDING').length
+      const skips    = d.scanDecisions.filter(x => !['ENTER','HOLDING'].includes(x.decision)).length
+      document.getElementById('scannerSummary').textContent =
+        d.scanDecisions.length + ' assets · ' + enters + ' entered · ' + skips + ' skipped' + (holdings ? ' · ' + holdings + ' held' : '')
+      if (d.lastScanAt) document.getElementById('scannerTs').textContent = 'Last scan: ' + new Date(d.lastScanAt).toLocaleTimeString()
+      const DEC = {
+        ENTER:   { cls: 'green',  label: '▲ ENTER'   },
+        HOLDING: { cls: 'yellow', label: '◈ HOLDING'  },
+        SKIP:    { cls: 'red',    label: '✕ SKIP'     },
+        LOW_APR: { cls: 'dim',    label: '~ LOW APR'  },
+        LOW_VOL: { cls: 'dim',    label: '~ LOW VOL'  },
+        COOLDOWN:{ cls: 'yellow', label: '◷ COOLDOWN' },
+        MAX_POS: { cls: 'dim',    label: '— MAX POS'  },
+        FAILED:  { cls: 'red',    label: '✕ FAILED'   },
+        PENDING: { cls: 'dim',    label: '? PENDING'  },
+      }
+      document.getElementById('scannerTbody').innerHTML = d.scanDecisions.map(s => {
+        const aprStr = (s.apr >= 0 ? '+' : '') + s.apr.toFixed(1) + '%'
+        const aprCls = s.apr < 0 ? 'green' : s.apr > 0 ? 'red' : ''
+        const side = s.isBuy
+          ? '<span class="pill long">LONG</span>'
+          : '<span class="pill short">SHORT</span>'
+        const vol = s.vol >= 1e6 ? '\$'+(s.vol/1e6).toFixed(1)+'M' : '\$'+(s.vol/1e3).toFixed(0)+'K'
+        const dec = DEC[s.decision] || { cls: 'dim', label: s.decision }
+        return '<tr>' +
+          '<td><b>' + s.asset + '</b></td>' +
+          '<td>' + side + '</td>' +
+          '<td class="' + aprCls + '" style="font-size:11px">' + aprStr + '</td>' +
+          '<td class="dim" style="font-size:11px">' + vol + '</td>' +
+          '<td class="' + dec.cls + '" style="font-size:11px;font-weight:600;letter-spacing:.5px">' + dec.label + '</td>' +
+          '<td style="font-size:11px;color:#8090b0">' + (s.reason || '—') + '</td>' +
+          '</tr>'
       }).join('')
     }
 
