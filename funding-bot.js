@@ -249,8 +249,12 @@ async function closePosition(asset, reason) {
     return mid
   }
   const result = await hl.closePosition(asset)
-  const exitPrice = parseFloat(result?.filled?.avgPx ?? result?.avgPrice ?? 0) || null
-  log(`CLOSED ${asset}:`, exitPrice ? `avg $${exitPrice}` : result?.error)
+  let exitPrice = parseFloat(result?.filled?.avgPx ?? result?.avgPrice ?? '')
+  if (!isFinite(exitPrice) || exitPrice <= 0) {
+    // fallback to mid price if close result doesn't have valid price
+    exitPrice = await hl.getMidPrice(asset).catch(() => null)
+  }
+  log(`CLOSED ${asset}:`, exitPrice ? `avg $${exitPrice.toFixed(6)}` : result?.error)
   return exitPrice
 }
 
