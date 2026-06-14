@@ -91,11 +91,14 @@ const BOOT_TS         = Date.now()
 
 // ── PERSISTENT STATE ──────────────────────────────────────────────────────────
 function loadState() {
-  if (!existsSync(STATE_FILE)) return { positions: {}, history: [], cooldowns: {}, blacklist: [] }
+  if (!existsSync(STATE_FILE)) return { positions: {}, history: [], cooldowns: {}, blacklist: [], totalTradesEver: 0, totalWinsEver: 0, totalLossesEver: 0 }
   const s = JSON.parse(readFileSync(STATE_FILE, 'utf8'))
   if (!s.history) s.history = []
   if (!s.cooldowns) s.cooldowns = {}
   if (!s.blacklist) s.blacklist = []
+  if (!s.totalTradesEver) s.totalTradesEver = 0
+  if (!s.totalWinsEver) s.totalWinsEver = 0
+  if (!s.totalLossesEver) s.totalLossesEver = 0
   // Sync blacklist into EXCLUDED so scan filters it
   for (const a of s.blacklist) EXCLUDED.add(a)
   return s
@@ -521,6 +524,9 @@ async function liveRefresh() {
         state.history.unshift({ asset, side: pos.isBuy ? 'LONG' : 'SHORT', entryPrice: pos.entryPrice,
           exitPrice, fundingAPR: pos.fundingAPR, openedAt: pos.openedAt, closedAt: now, reason: exitReason, pnlUsd,
           sizeUsd: pos.sizeUsd, settlementsCollected: pos.settlementsCollected ?? 0 })
+        state.totalTradesEver++
+        if (pnlUsd != null && pnlUsd > 0) state.totalWinsEver++
+        if (pnlUsd != null && pnlUsd < 0) state.totalLossesEver++
         if (state.history.length > 100) state.history = state.history.slice(0, 100)
         if (exitReason.startsWith('stop-loss') || exitReason.startsWith('trailing-stop') || exitReason.startsWith('price-spike'))
           state.cooldowns[asset] = now + 2 * 3600000
@@ -563,9 +569,9 @@ function apiStatus() {
 
   const hoursToSettle = hoursUntilNextSettlement()
   const fullHistory = state.history
-  const totalTrades = fullHistory.length
-  const totalWins   = fullHistory.filter(t => (t.pnlUsd ?? null) !== null && t.pnlUsd > 0).length
-  const totalLosses = fullHistory.filter(t => (t.pnlUsd ?? null) !== null && t.pnlUsd < 0).length
+  const totalTrades = state.totalTradesEver || fullHistory.length
+  const totalWins   = state.totalWinsEver || fullHistory.filter(t => t.pnlUsd != null && t.pnlUsd > 0).length
+  const totalLosses = state.totalLossesEver || fullHistory.filter(t => t.pnlUsd != null && t.pnlUsd < 0).length
   const totalClosedPnl = fullHistory.reduce((s, t) => s + (t.pnlUsd ?? 0), 0)
   return { equity, avail, positions, openCount: positions.length, history: state.history.slice(0, 50),
     totalTrades, totalWins, totalLosses, totalClosedPnl,
@@ -589,6 +595,9 @@ async function apiClose(asset) {
     state.history.unshift({ asset, side: pos.isBuy ? 'LONG' : 'SHORT', entryPrice: pos.entryPrice,
       exitPrice, fundingAPR: pos.fundingAPR, openedAt: pos.openedAt, closedAt: Date.now(),
       reason: 'manual', pnlUsd, sizeUsd: pos.sizeUsd, settlementsCollected: pos.settlementsCollected ?? 0 })
+    state.totalTradesEver++
+    if (pnlUsd != null && pnlUsd > 0) state.totalWinsEver++
+    if (pnlUsd != null && pnlUsd < 0) state.totalLossesEver++
     delete state.positions[asset]
     saveState(state)
   })
