@@ -96,9 +96,12 @@ function loadState() {
   if (!s.history) s.history = []
   if (!s.cooldowns) s.cooldowns = {}
   if (!s.blacklist) s.blacklist = []
-  if (!s.totalTradesEver) s.totalTradesEver = 0
-  if (!s.totalWinsEver) s.totalWinsEver = 0
-  if (!s.totalLossesEver) s.totalLossesEver = 0
+  // Initialize counters from history if they don't exist (backward compat with old state files)
+  if (s.totalTradesEver == null) {
+    s.totalTradesEver = s.history.length
+    s.totalWinsEver = s.history.filter(t => t.pnlUsd != null && t.pnlUsd > 0).length
+    s.totalLossesEver = s.history.filter(t => t.pnlUsd != null && t.pnlUsd < 0).length
+  }
   // Sync blacklist into EXCLUDED so scan filters it
   for (const a of s.blacklist) EXCLUDED.add(a)
   return s
@@ -569,9 +572,9 @@ function apiStatus() {
 
   const hoursToSettle = hoursUntilNextSettlement()
   const fullHistory = state.history
-  const totalTrades = state.totalTradesEver || fullHistory.length
-  const totalWins   = state.totalWinsEver || fullHistory.filter(t => t.pnlUsd != null && t.pnlUsd > 0).length
-  const totalLosses = state.totalLossesEver || fullHistory.filter(t => t.pnlUsd != null && t.pnlUsd < 0).length
+  const totalTrades = state.totalTradesEver ?? fullHistory.length
+  const totalWins   = state.totalWinsEver ?? fullHistory.filter(t => t.pnlUsd != null && t.pnlUsd > 0).length
+  const totalLosses = state.totalLossesEver ?? fullHistory.filter(t => t.pnlUsd != null && t.pnlUsd < 0).length
   const totalClosedPnl = fullHistory.reduce((s, t) => s + (t.pnlUsd ?? 0), 0)
   return { equity, avail, positions, openCount: positions.length, history: state.history.slice(0, 50),
     totalTrades, totalWins, totalLosses, totalClosedPnl,
