@@ -91,7 +91,7 @@ const BOOT_TS         = Date.now()
 
 // ── PERSISTENT STATE ──────────────────────────────────────────────────────────
 function loadState() {
-  if (!existsSync(STATE_FILE)) return { positions: {}, history: [], cooldowns: {}, blacklist: [], totalTradesEver: 0, totalWinsEver: 0, totalLossesEver: 0 }
+  if (!existsSync(STATE_FILE)) return { positions: {}, history: [], cooldowns: {}, blacklist: [], totalTradesEver: 0, totalWinsEver: 0, totalLossesEver: 0, totalPnlEver: 0 }
   const s = JSON.parse(readFileSync(STATE_FILE, 'utf8'))
   if (!s.history) s.history = []
   if (!s.cooldowns) s.cooldowns = {}
@@ -101,7 +101,9 @@ function loadState() {
     s.totalTradesEver = s.history.length
     s.totalWinsEver = s.history.filter(t => t.pnlUsd != null && t.pnlUsd > 0).length
     s.totalLossesEver = s.history.filter(t => t.pnlUsd != null && t.pnlUsd < 0).length
+    s.totalPnlEver = s.history.reduce((sum, t) => sum + (t.pnlUsd ?? 0), 0)
   }
+  if (s.totalPnlEver == null) s.totalPnlEver = s.history.reduce((sum, t) => sum + (t.pnlUsd ?? 0), 0)
   // Sync blacklist into EXCLUDED so scan filters it
   for (const a of s.blacklist) EXCLUDED.add(a)
   return s
@@ -145,7 +147,7 @@ async function syncPositionsFromHL() {
             isBuy, entryPrice: entryPx, openedAt: now,
             fundingAPR: 0, sizeUsd: Math.abs(szi) * entryPx,
             settlesAt: now + hoursUntilNextSettlement() * 3600000,
-            peakPrice: entryPx,
+            peakPrice: entryPx, settlementsCollected: 0,
           }
           synced++
           log(`[sync] Recovered ${isBuy?'LONG':'SHORT'} ${asset} @ ${entryPx} from Hyperliquid`)
@@ -530,6 +532,7 @@ async function liveRefresh() {
         state.totalTradesEver++
         if (pnlUsd != null && pnlUsd > 0) state.totalWinsEver++
         if (pnlUsd != null && pnlUsd < 0) state.totalLossesEver++
+        state.totalPnlEver = (state.totalPnlEver ?? 0) + (pnlUsd ?? 0)
         if (state.history.length > 100) state.history = state.history.slice(0, 100)
         if (exitReason.startsWith('stop-loss') || exitReason.startsWith('trailing-stop') || exitReason.startsWith('price-spike'))
           state.cooldowns[asset] = now + 2 * 3600000
@@ -572,11 +575,11 @@ function apiStatus() {
 
   const hoursToSettle = hoursUntilNextSettlement()
   const fullHistory = state.history
-  const totalTrades = state.totalTradesEver ?? fullHistory.length
-  const totalWins   = state.totalWinsEver ?? fullHistory.filter(t => t.pnlUsd != null && t.pnlUsd > 0).length
-  const totalLosses = state.totalLossesEver ?? fullHistory.filter(t => t.pnlUsd != null && t.pnlUsd < 0).length
-  const totalClosedPnl = fullHistory.reduce((s, t) => s + (t.pnlUsd ?? 0), 0)
-  return { equity, avail, positions, openCount: positions.length, history: state.history.slice(0, 50),
+  const totalTrades    = state.totalTradesEver ?? fullHistory.length
+  const totalWins      = state.totalWinsEver ?? fullHistory.filter(t => t.pnlUsd != null && t.pnlUsd > 0).length
+  const totalLosses    = state.totalLossesEver ?? fullHistory.filter(t => t.pnlUsd != null && t.pnlUsd < 0).length
+  const totalClosedPnl = state.totalPnlEver ?? fullHistory.reduce((s, t) => s + (t.pnlUsd ?? 0), 0)
+  return { equity, avail, positions, openCount: positions.length, history: state.history.slice(0, 100),
     totalTrades, totalWins, totalLosses, totalClosedPnl,
     rates, paused, scanning, cfg: CFG, mode: CFG.dryRun ? 'DRY RUN' : 'LIVE',
     wallet: identity.hl.address, hoursToSettle, scanDecisions, lastScanAt,
@@ -601,6 +604,7 @@ async function apiClose(asset) {
     state.totalTradesEver++
     if (pnlUsd != null && pnlUsd > 0) state.totalWinsEver++
     if (pnlUsd != null && pnlUsd < 0) state.totalLossesEver++
+    state.totalPnlEver = (state.totalPnlEver ?? 0) + (pnlUsd ?? 0)
     delete state.positions[asset]
     saveState(state)
   })
@@ -993,7 +997,7 @@ tbody.fresh tr{animation:rowin 0.3s ease-out backwards;animation-delay:calc(var(
     <!-- PnL Chart -->
     <div class="panel">
       <div class="panel-head">
-        <h2>P&amp;L Since Inception</h2>
+        <h2>Realised P&amp;L</h2>
         <span class="meta" id="pnlChartTotal"></span>
         <span class="right"><span class="green">●</span> win&nbsp;&nbsp;<span class="red">●</span> loss</span>
       </div>
