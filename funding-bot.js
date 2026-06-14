@@ -447,7 +447,7 @@ async function liveRefresh() {
       lastMidPrices[asset] = mid
 
       const pricePct   = ((mid - pos.entryPrice) / pos.entryPrice) * 100
-      const adversePct = pos.isBuy ? -pricePct : pricePct
+      const adversePct = pos.isBuy ? Math.max(0, -pricePct) : Math.max(0, pricePct)
       const heldHours  = (now - pos.openedAt) / 3600000
 
       // Update trailing peak
@@ -515,7 +515,8 @@ async function liveRefresh() {
         const exitPrice = await closePosition(asset, exitReason)
         const pnlUsd    = exitPrice ? ((exitPrice - pos.entryPrice) / pos.entryPrice) * (pos.sizeUsd ?? CFG.positionUsd) * (pos.isBuy ? 1 : -1) : null
         state.history.unshift({ asset, side: pos.isBuy ? 'LONG' : 'SHORT', entryPrice: pos.entryPrice,
-          exitPrice, fundingAPR: pos.fundingAPR, openedAt: pos.openedAt, closedAt: now, reason: exitReason, pnlUsd })
+          exitPrice, fundingAPR: pos.fundingAPR, openedAt: pos.openedAt, closedAt: now, reason: exitReason, pnlUsd,
+          sizeUsd: pos.sizeUsd, settlementsCollected: pos.settlementsCollected ?? 0 })
         if (state.history.length > 100) state.history = state.history.slice(0, 100)
         if (exitReason.startsWith('stop-loss') || exitReason.startsWith('trailing-stop') || exitReason.startsWith('price-spike'))
           state.cooldowns[asset] = now + 2 * 3600000
@@ -544,7 +545,7 @@ function apiStatus() {
   const positions = Object.entries(state.positions).map(([asset, pos]) => {
     const mid        = lastMidPrices[asset] ?? null
     const pricePct   = mid ? ((mid - pos.entryPrice) / pos.entryPrice) * 100 : null
-    const adversePct = pricePct !== null ? (pos.isBuy ? -pricePct : pricePct) : null
+    const adversePct = pricePct !== null ? (pos.isBuy ? Math.max(0, -pricePct) : Math.max(0, pricePct)) : null
     const pnlUsd     = pricePct !== null ? (pricePct / 100) * (pos.sizeUsd ?? CFG.positionUsd) * (pos.isBuy ? 1 : -1) : null
     return { asset, side: pos.isBuy ? 'LONG' : 'SHORT', entryPrice: pos.entryPrice,
       midPrice: mid, fundingAPR: pos.fundingAPR, heldHours: (Date.now() - pos.openedAt) / 3600000,
@@ -583,7 +584,7 @@ async function apiClose(asset) {
     if (!state.positions[asset]) return
     state.history.unshift({ asset, side: pos.isBuy ? 'LONG' : 'SHORT', entryPrice: pos.entryPrice,
       exitPrice, fundingAPR: pos.fundingAPR, openedAt: pos.openedAt, closedAt: Date.now(),
-      reason: 'manual', pnlUsd })
+      reason: 'manual', pnlUsd, sizeUsd: pos.sizeUsd, settlementsCollected: pos.settlementsCollected ?? 0 })
     delete state.positions[asset]
     saveState(state)
   })
