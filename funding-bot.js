@@ -91,7 +91,7 @@ const BOOT_TS         = Date.now()
 
 // ── PERSISTENT STATE ──────────────────────────────────────────────────────────
 function loadState() {
-  if (!existsSync(STATE_FILE)) return { positions: {}, history: [], cooldowns: {}, blacklist: [], totalTradesEver: 0, totalWinsEver: 0, totalLossesEver: 0, totalPnlEver: 0 }
+  if (!existsSync(STATE_FILE)) return { positions: {}, history: [], cooldowns: {}, blacklist: [], totalTradesEver: 0, totalWinsEver: 0, totalLossesEver: 0, totalPnlEver: 0, fundingIncomeEver: 0, fundingByCoin: {}, fundingCursor: null }
   const s = JSON.parse(readFileSync(STATE_FILE, 'utf8'))
   if (!s.history) s.history = []
   if (!s.cooldowns) s.cooldowns = {}
@@ -104,6 +104,10 @@ function loadState() {
     s.totalPnlEver = s.history.reduce((sum, t) => sum + (t.pnlUsd ?? 0), 0)
   }
   if (s.totalPnlEver == null) s.totalPnlEver = s.history.reduce((sum, t) => sum + (t.pnlUsd ?? 0), 0)
+  // Funding income tracking (Phase 0 — measure the carry edge, separate from price PnL)
+  if (s.fundingIncomeEver == null) s.fundingIncomeEver = 0
+  if (s.fundingByCoin == null) s.fundingByCoin = {}
+  if (s.fundingCursor === undefined) s.fundingCursor = null
   // Sync blacklist into EXCLUDED so scan filters it
   for (const a of s.blacklist) EXCLUDED.add(a)
   return s
@@ -181,6 +185,22 @@ async function getAllFundingRates() {
       volume24h: parseFloat(ctxs[i]?.dayNtlVlm ?? 0),
     })).filter(a => !EXCLUDED.has(a.asset))
   } catch { return [] }
+}
+
+// Pull user funding-payment ledger from Hyperliquid. delta.usdc is signed: positive = funding RECEIVED.
+// Returns { usd, byCoin, count } summed over [startTime, endTime], or null on error (caller must not advance cursor).
+async function getUserFundingUsd(startTime, endTime) {
+  try {
+    const rows = await hl.info.userFunding({ user: identity.hl.address, startTime, endTime })
+    let usd = 0; const byCoin = {}
+    for (const r of rows ?? []) {
+      const v = parseFloat(r?.delta?.usdc ?? '0')
+      if (!isFinite(v)) continue
+      usd += v
+      byCoin[r.delta.coin] = (byCoin[r.delta.coin] ?? 0) + v
+    }
+    return { usd, byCoin, count: (rows ?? []).length }
+  } catch (e) { log('getUserFundingUsd error:', e.message); return null }
 }
 
 // Trend + volatility filter — returns { ok, reason }
@@ -552,6 +572,37 @@ function scheduleLiveRefresh() {
   setTimeout(async () => { await liveRefresh(); scheduleLiveRefresh() }, CFG.liveRefreshMs ?? 5000)
 }
 
+// ── FUNDING INCOME TRACKER (Phase 0) ────────────────────────────────────────────
+// Isolated from trade logic: only READS the HL funding ledger and accumulates it into state.
+// First run backfills up to 30d so the inception number is meaningful; then forward-only via cursor.
+const FUNDING_BACKFILL_MS = 30 * 24 * 3600 * 1000
+let fundingTrackerRunning = false
+async function refreshFundingIncome() {
+  if (fundingTrackerRunning) return
+  fundingTrackerRunning = true
+  try {
+    const now = Date.now()
+    const pre = loadState()
+    const start = pre.fundingCursor ?? (now - FUNDING_BACKFILL_MS)
+    if (start >= now) return
+    const res = await getUserFundingUsd(start, now)
+    if (!res) return  // error — leave cursor unchanged, retry next tick
+    await lockState(async () => {
+      const state = loadState()
+      state.fundingIncomeEver = (state.fundingIncomeEver ?? 0) + res.usd
+      state.fundingByCoin = state.fundingByCoin ?? {}
+      for (const [coin, v] of Object.entries(res.byCoin)) state.fundingByCoin[coin] = (state.fundingByCoin[coin] ?? 0) + v
+      state.fundingCursor = now
+      saveState(state)
+    })
+    if (res.count) log(`[funding] +$${res.usd.toFixed(6)} over ${res.count} payments | total $${((pre.fundingIncomeEver ?? 0) + res.usd).toFixed(4)}`)
+  } catch (e) { log('refreshFundingIncome error:', e.message) }
+  finally { fundingTrackerRunning = false }
+}
+function scheduleFundingTracker() {
+  setTimeout(async () => { await refreshFundingIncome(); scheduleFundingTracker() }, 5 * 60 * 1000)  // every 5 min
+}
+
 // ── API HANDLERS ──────────────────────────────────────────────────────────────
 function apiStatus() {
   const state  = loadState()
@@ -579,8 +630,11 @@ function apiStatus() {
   const totalWins      = state.totalWinsEver ?? fullHistory.filter(t => t.pnlUsd != null && t.pnlUsd > 0).length
   const totalLosses    = state.totalLossesEver ?? fullHistory.filter(t => t.pnlUsd != null && t.pnlUsd < 0).length
   const totalClosedPnl = state.totalPnlEver ?? fullHistory.reduce((s, t) => s + (t.pnlUsd ?? 0), 0)
+  const fundingIncomeEver = state.fundingIncomeEver ?? 0
+  const netRealisedEver   = totalClosedPnl + fundingIncomeEver
   return { equity, avail, positions, openCount: positions.length, history: state.history.slice(0, 100),
     totalTrades, totalWins, totalLosses, totalClosedPnl,
+    fundingIncomeEver, fundingByCoin: state.fundingByCoin ?? {}, netRealisedEver,
     rates, paused, scanning, cfg: CFG, mode: CFG.dryRun ? 'DRY RUN' : 'LIVE',
     wallet: identity.hl.address, hoursToSettle, scanDecisions, lastScanAt,
     regime: btcFundingRegime, crowdedRatio: crowdedLongRatio, startedAt: BOOT_TS,
@@ -957,6 +1011,8 @@ tbody.fresh tr{animation:rowin 0.3s ease-out backwards;animation-delay:calc(var(
         <div class="lbl">Realised P&amp;L</div><div class="val" id="closedPnl">—</div>
         <div class="sub"><span class="green"><span id="winCount">0</span>W</span> · <span class="red"><span id="lossCount">0</span>L</span> · <span id="winRate">—</span> WR</div>
       </div>
+      <div class="cell"><div class="lbl">Funding Collected</div><div class="val" id="fundingPnl">—</div></div>
+      <div class="cell"><div class="lbl">Net Realised</div><div class="val" id="netPnl">—</div><div class="sub">price + funding</div></div>
       <div class="cell"><div class="lbl">Positions</div><div class="val" id="openCount">—</div></div>
       <div class="cell"><div class="lbl">Trades</div><div class="val" id="totalTrades">—</div></div>
     </div>
@@ -1514,6 +1570,10 @@ async function refresh(){
     setVal('openPnl', fmtUsd(openPnl), openPnl, openPnl>0?'pos':openPnl<0?'neg':'', fmtUsd)
     var closedPnl = d.totalClosedPnl != null ? d.totalClosedPnl : d.history.reduce(function(s,t){return s+(t.pnlUsd||0)},0)
     setVal('closedPnl', fmtUsd(closedPnl), closedPnl, closedPnl>0?'pos':closedPnl<0?'neg':'', fmtUsd)
+    var fundingPnl = d.fundingIncomeEver || 0
+    setVal('fundingPnl', fmtUsd(fundingPnl), fundingPnl, fundingPnl>0?'pos':fundingPnl<0?'neg':'', fmtUsd)
+    var netPnl = (d.netRealisedEver != null) ? d.netRealisedEver : (closedPnl + fundingPnl)
+    setVal('netPnl', fmtUsd(netPnl), netPnl, netPnl>0?'pos':netPnl<0?'neg':'', fmtUsd)
     var wins = d.totalWins||0, losses = d.totalLosses||0
     $('winCount').textContent = wins; $('lossCount').textContent = losses
     $('winRate').textContent = (wins+losses) ? Math.round(wins/(wins+losses)*100)+'%' : '—'
@@ -1782,3 +1842,5 @@ await syncPositionsFromHL()
 await scan()
 scheduleScan()
 scheduleLiveRefresh()
+refreshFundingIncome()      // prime funding income on boot (read-only)
+scheduleFundingTracker()    // then refresh every 5 min
