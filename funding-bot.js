@@ -26,7 +26,7 @@ let CFG = {
   trailingStopHighApr:  5.0,  // trail % for high-APR positions
   dynamicSizing:        true, // scale position size with APR
   maxPositionUsd:       60,   // max size when APR >= highAprThreshold
-  maxSettlements:           1,  // hourly settlements to collect before exiting (1 = current behaviour)
+  maxSettlements:           4,  // hourly settlements to collect before exiting
   highAprMaxSettlements:    3,  // settlements for positions with APR >= highAprThreshold
   aprTrendFilter:        true,  // skip entry if APR has fallen >20% from its 6-scan peak
   regimeFlipCooldownMins:  10,  // mins to wait after crowded_long→neutral before allowing LONGs
@@ -55,6 +55,8 @@ const u = p => pathToFileURL(p).href
 if (existsSync(CONFIG_FILE)) {
   try { Object.assign(CFG, JSON.parse(readFileSync(CONFIG_FILE, 'utf8'))) } catch {}
 }
+// Migration: maxHoldHours < 3 neutered multi-settlement holding — auto-correct
+if (CFG.maxHoldHours < 3) { CFG.maxHoldHours = 4 }
 
 // ── LOAD WALLET + CLIENT ───────────────────────────────────────────────────────
 const privateKey = process.env.PRIVATE_KEY ||
@@ -206,6 +208,9 @@ async function getUserFundingUsd(startTime, endTime) {
 // Trend + volatility filter — returns { ok, reason }
 async function passesEntryFilters(asset, isBuy, aprAbs = 0) {
   try {
+    // Hard cap: APR > 1500% signals a short squeeze, not stable carry — too volatile for SL to protect
+    if (aprAbs > 1500) return { ok: false, reason: `extreme APR ${aprAbs.toFixed(0)}% > 1500% cap — squeeze risk, not stable carry` }
+
     const now     = Date.now()
     const candles = await hl.info.candleSnapshot({ coin: asset, interval: '1h', startTime: now - 5*3600000, endTime: now })
     if (!candles?.length) return { ok: true, reason: 'no candle data' }
@@ -240,6 +245,8 @@ async function passesEntryFilters(asset, isBuy, aprAbs = 0) {
 // ── POSITION MANAGEMENT ───────────────────────────────────────────────────────
 function calcPositionSize(aprAbs) {
   if (!CFG.dynamicSizing) return CFG.positionUsd
+  // Above 3× highAprThreshold (e.g. 900%) = squeeze territory — size DOWN to base (high vol, unreliable carry)
+  if (aprAbs > CFG.highAprThreshold * 3) return CFG.positionUsd
   const t = Math.min(1, Math.max(0, (aprAbs - CFG.minFundingApr) / (CFG.highAprThreshold - CFG.minFundingApr)))
   return Math.round(CFG.positionUsd + t * (CFG.maxPositionUsd - CFG.positionUsd))
 }
