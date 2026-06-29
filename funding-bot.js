@@ -39,7 +39,7 @@ let CFG = {
   maxVolatilityPct: 5,     // skip if 1h range > 5% (0 = disabled)
   scanIntervalMs:   60 * 1000, // 1 min — entry scan
   liveRefreshMs:    5 * 1000,  // 5s — SL + price monitoring
-  priceChangePct:   1.0,   // emergency exit if price moves this % in one tick (0 = disabled)
+  priceChangePct:   2.5,   // emergency exit if price moves this % in one tick (0 = disabled)
 }
 
 const PORT       = parseInt(process.env.PORT || '3505')
@@ -110,6 +110,10 @@ function loadState() {
   if (s.fundingIncomeEver == null) s.fundingIncomeEver = 0
   if (s.fundingByCoin == null) s.fundingByCoin = {}
   if (s.fundingCursor === undefined) s.fundingCursor = null
+  // Restore rateHistory so APR trend filter survives redeploys
+  if (s.rateHistory && typeof s.rateHistory === 'object') {
+    for (const [a, h] of Object.entries(s.rateHistory)) rateHistory[a] = h
+  }
   // Sync blacklist into EXCLUDED so scan filters it
   for (const a of s.blacklist) EXCLUDED.add(a)
   return s
@@ -216,10 +220,11 @@ async function passesEntryFilters(asset, isBuy, aprAbs = 0) {
     if (!candles?.length) return { ok: true, reason: 'no candle data' }
 
     // Volatility gate: APR-scaled ceiling
-    // Base: CFG.maxVolatilityPct. For every 100% APR above 100%, allow +1% extra vol, cap at 3×base.
+    // Base: CFG.maxVolatilityPct. For every 100% APR above 100%, allow +1% extra vol, cap at 2×base.
+    // Capped at 2× (not 3×): high-APR assets are more volatile, not less risky.
     if (CFG.maxVolatilityPct > 0) {
       const aprBonus    = Math.max(0, (aprAbs - 100) / 100)   // extra % per 100 APR above 100%
-      const volCeiling  = Math.min(CFG.maxVolatilityPct * 3, CFG.maxVolatilityPct + aprBonus)
+      const volCeiling  = Math.min(CFG.maxVolatilityPct * 2, CFG.maxVolatilityPct + aprBonus)
       const last = candles[candles.length - 1]
       const rangePct = ((parseFloat(last.h) - parseFloat(last.l)) / parseFloat(last.l)) * 100
       if (rangePct > volCeiling)
@@ -454,6 +459,8 @@ async function scan() {
   const equity = cachedBal?.equity ?? '?'
   log(`Scan complete | equity $${equity} | open: ${Object.keys(state.positions).length}/${CFG.maxPositions} | next entry-scan in ${CFG.scanIntervalMs/1000}s`)
   log('---')
+  // Persist rateHistory so APR trend filter survives redeploys
+  await lockState(async () => { const s = loadState(); s.rateHistory = rateHistory; saveState(s) })
   } catch (e) {
     log('Scan error:', e.message)
   } finally {
@@ -525,7 +532,7 @@ async function liveRefresh() {
         const flipped    = Math.sign(currentAprSigned) !== Math.sign(entryAprSigned) && currentAbs > 5
         if (entryAbs >= CFG.minFundingApr && flipped) {
           exitReason = `funding-flip: APR ${entryAprSigned.toFixed(0)}% → ${currentAprSigned.toFixed(0)}% (now paying against us)`
-        } else if (entryAbs >= CFG.minFundingApr && currentAbs < entryAbs * 0.40) {
+        } else if (entryAbs >= CFG.minFundingApr && currentAbs < Math.max(entryAbs * 0.40, CFG.minFundingApr)) {
           exitReason = `funding-collapse: APR ${entryAbs.toFixed(0)}% → ${currentAbs.toFixed(0)}% (yield gone, pure directional risk now)`
         }
       }
