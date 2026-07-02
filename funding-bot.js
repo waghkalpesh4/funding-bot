@@ -73,6 +73,19 @@ const identity = await spawnAgent(new ethers.Wallet(privateKey), 'hero')
 const hl = new HyperliquidClient(CFG.dryRun ? identity.hl.address : identity.hl.privateKey)
 await hl.ensureMeta()
 
+// PATCH: @b402ai/trader formatPrice() only enforces 5 significant figures, not Hyperliquid's
+// max-decimals rule (6 - szDecimals for perps). Low-priced assets (MANTA, OP, ...) get
+// 6-decimal prices → "Order has invalid price" → close orders silently rejected.
+// Re-normalize limitPx here — every order path (entry, close, limit) goes through placeOrder.
+function fmtPx(asset, price) {
+  const szDec  = hl.getSzDecimals(asset)
+  const maxDec = Math.max(0, 6 - szDec)
+  const sig5   = Number(Number(price).toPrecision(5))
+  return String(Number(sig5.toFixed(maxDec)))
+}
+const _placeOrder = hl.placeOrder.bind(hl)
+hl.placeOrder = (params) => _placeOrder({ ...params, limitPx: fmtPx(params.asset, parseFloat(params.limitPx)) })
+
 const log = (...a) => console.log(`[${new Date().toISOString()}]`, ...a)
 
 // ── RUNTIME STATE ─────────────────────────────────────────────────────────────
@@ -215,6 +228,12 @@ async function passesEntryFilters(asset, isBuy, aprAbs = 0) {
     // Hard cap: APR > 1500% signals a short squeeze, not stable carry — too volatile for SL to protect
     if (aprAbs > 1500) return { ok: false, reason: `extreme APR ${aprAbs.toFixed(0)}% > 1500% cap — squeeze risk, not stable carry` }
 
+    // Extreme NEGATIVE funding = market violently short because price is crashing.
+    // Going long to harvest it is catching a falling knife (MANTA -597% APR → -$4.4 in one trade).
+    const negAprCap = CFG.highAprThreshold ?? 300
+    if (isBuy && aprAbs > negAprCap)
+      return { ok: false, reason: `extreme negative funding ${aprAbs.toFixed(0)}% > ${negAprCap}% — crash in progress, no LONG` }
+
     const now     = Date.now()
     const candles = await hl.info.candleSnapshot({ coin: asset, interval: '1h', startTime: now - 5*3600000, endTime: now })
     if (!candles?.length) return { ok: true, reason: 'no candle data' }
@@ -281,21 +300,36 @@ async function openPosition(asset, isBuy, fundingAPR) {
   return { ...result, sizeUsd }
 }
 
+// Returns { ok, exitPrice, error }. Callers MUST NOT drop the position from state unless ok.
+// A rejected close order previously went unnoticed: the bot logged the trade as closed while
+// the position stayed open on HL, unmonitored (MANTA 2026-06-30: logged -$0.84, real -$4.4).
 async function closePosition(asset, reason) {
   log(`EXIT ${asset} — ${reason}`)
   if (CFG.dryRun) {
     const mid = await hl.getMidPrice(asset)
     log(`[DRY RUN] Would close ${asset} at $${mid.toFixed(4)}`)
-    return mid
+    return { ok: true, exitPrice: mid }
   }
   const result = await hl.closePosition(asset)
+  if (!result?.success) {
+    log(`CLOSE FAILED ${asset} — keeping position tracked:`, result?.error ?? 'unknown error')
+    return { ok: false, error: result?.error ?? 'unknown error' }
+  }
+  // Verify actually flat — an IOC close can "succeed" without fully filling
+  const acc   = await hl.getAccountState(identity.hl.address).catch(() => null)
+  const still = acc?.positions?.find(p =>
+    (p.asset ?? p.coin) === asset && Math.abs(parseFloat(p.size ?? p.szi ?? 0)) > 0.0001)
+  if (still) {
+    log(`CLOSE INCOMPLETE ${asset} — position still open on HL, keeping tracked`)
+    return { ok: false, error: 'position still open after close order' }
+  }
   let exitPrice = parseFloat(result?.filled?.avgPx ?? result?.avgPrice ?? '')
   if (!isFinite(exitPrice) || exitPrice <= 0) {
     // fallback to mid price if close result doesn't have valid price
     exitPrice = await hl.getMidPrice(asset).catch(() => null)
   }
-  log(`CLOSED ${asset}:`, exitPrice ? `avg $${exitPrice.toFixed(6)}` : result?.error)
-  return exitPrice
+  log(`CLOSED ${asset}:`, exitPrice ? `avg $${exitPrice.toFixed(6)}` : 'no fill price')
+  return { ok: true, exitPrice }
 }
 
 // ── SCAN ──────────────────────────────────────────────────────────────────────
@@ -304,6 +338,9 @@ async function scan() {
   if (paused)   { log('Bot paused, skipping scan'); return }
   scanning = true
   try {
+  // Recover any HL positions the bot lost track of (failed close, crash, manual trade)
+  // so they get stop-loss monitoring instead of bleeding unwatched.
+  await syncPositionsFromHL()
   const state = loadState()
   const now   = Date.now()
   lastScanAt  = now
@@ -558,7 +595,14 @@ async function liveRefresh() {
         exitReason = `max hold ${heldHours.toFixed(1)}h`
 
       if (exitReason) {
-        const exitPrice = await closePosition(asset, exitReason)
+        const closeRes = await closePosition(asset, exitReason)
+        if (!closeRes.ok) {
+          // Close rejected/incomplete — keep position tracked so SL keeps watching; retry next tick
+          pos.closeFailures = (pos.closeFailures ?? 0) + 1
+          changed = true
+          continue
+        }
+        const exitPrice = closeRes.exitPrice
         const pnlUsd    = exitPrice ? ((exitPrice - pos.entryPrice) / pos.entryPrice) * (pos.sizeUsd ?? CFG.positionUsd) * (pos.isBuy ? 1 : -1) : null
         state.history.unshift({ asset, side: pos.isBuy ? 'LONG' : 'SHORT', entryPrice: pos.entryPrice,
           exitPrice, fundingAPR: pos.fundingAPR, openedAt: pos.openedAt, closedAt: now, reason: exitReason, pnlUsd,
@@ -658,9 +702,11 @@ function apiStatus() {
 async function apiClose(asset) {
   const pre = loadState()
   if (!pre.positions[asset]) return { error: 'Position not found' }
-  const pos       = pre.positions[asset]
-  const mid       = await hl.getMidPrice(asset).catch(() => null)
-  const exitPrice = await closePosition(asset, 'manual close from dashboard') ?? mid
+  const pos      = pre.positions[asset]
+  const mid      = await hl.getMidPrice(asset).catch(() => null)
+  const closeRes = await closePosition(asset, 'manual close from dashboard')
+  if (!closeRes.ok) return { error: `Close failed: ${closeRes.error}` }
+  const exitPrice = closeRes.exitPrice ?? mid
   const pricePct  = exitPrice ? ((exitPrice - pos.entryPrice) / pos.entryPrice) * 100 : null
   const pnlUsd    = pricePct !== null ? (pricePct / 100) * (pos.sizeUsd ?? CFG.positionUsd) * (pos.isBuy ? 1 : -1) : null
   await lockState(async () => {
