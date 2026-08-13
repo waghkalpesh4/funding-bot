@@ -26,7 +26,7 @@ let CFG = {
   trailingStopHighApr:  5.0,  // trail % for high-APR positions
   dynamicSizing:        true, // scale position size with APR
   maxPositionUsd:       60,   // max size when APR >= highAprThreshold
-  maxSettlements:           1,  // hourly settlements to collect before exiting (1 = current behaviour)
+  maxSettlements:           4,  // hourly settlements to collect before exiting
   highAprMaxSettlements:    3,  // settlements for positions with APR >= highAprThreshold
   aprTrendFilter:        true,  // skip entry if APR has fallen >20% from its 6-scan peak
   regimeFlipCooldownMins:  10,  // mins to wait after crowded_long→neutral before allowing LONGs
@@ -39,7 +39,7 @@ let CFG = {
   maxVolatilityPct: 5,     // skip if 1h range > 5% (0 = disabled)
   scanIntervalMs:   60 * 1000, // 1 min — entry scan
   liveRefreshMs:    5 * 1000,  // 5s — SL + price monitoring
-  priceChangePct:   1.0,   // emergency exit if price moves this % in one tick (0 = disabled)
+  priceChangePct:   2.5,   // emergency exit if price moves this % in one tick (0 = disabled)
 }
 
 const PORT       = parseInt(process.env.PORT || '3505')
@@ -55,6 +55,8 @@ const u = p => pathToFileURL(p).href
 if (existsSync(CONFIG_FILE)) {
   try { Object.assign(CFG, JSON.parse(readFileSync(CONFIG_FILE, 'utf8'))) } catch {}
 }
+// Migration: maxHoldHours < 3 neutered multi-settlement holding — auto-correct
+if (CFG.maxHoldHours < 3) { CFG.maxHoldHours = 4 }
 
 // ── LOAD WALLET + CLIENT ───────────────────────────────────────────────────────
 const privateKey = process.env.PRIVATE_KEY ||
@@ -70,6 +72,19 @@ const { spawnAgent }        = await import(u(join(PKG_DIST, 'identity/derivation
 const identity = await spawnAgent(new ethers.Wallet(privateKey), 'hero')
 const hl = new HyperliquidClient(CFG.dryRun ? identity.hl.address : identity.hl.privateKey)
 await hl.ensureMeta()
+
+// PATCH: @b402ai/trader formatPrice() only enforces 5 significant figures, not Hyperliquid's
+// max-decimals rule (6 - szDecimals for perps). Low-priced assets (MANTA, OP, ...) get
+// 6-decimal prices → "Order has invalid price" → close orders silently rejected.
+// Re-normalize limitPx here — every order path (entry, close, limit) goes through placeOrder.
+function fmtPx(asset, price) {
+  const szDec  = hl.getSzDecimals(asset)
+  const maxDec = Math.max(0, 6 - szDec)
+  const sig5   = Number(Number(price).toPrecision(5))
+  return String(Number(sig5.toFixed(maxDec)))
+}
+const _placeOrder = hl.placeOrder.bind(hl)
+hl.placeOrder = (params) => _placeOrder({ ...params, limitPx: fmtPx(params.asset, parseFloat(params.limitPx)) })
 
 const log = (...a) => console.log(`[${new Date().toISOString()}]`, ...a)
 
@@ -91,11 +106,27 @@ const BOOT_TS         = Date.now()
 
 // ── PERSISTENT STATE ──────────────────────────────────────────────────────────
 function loadState() {
-  if (!existsSync(STATE_FILE)) return { positions: {}, history: [], cooldowns: {}, blacklist: [] }
+  if (!existsSync(STATE_FILE)) return { positions: {}, history: [], cooldowns: {}, blacklist: [], totalTradesEver: 0, totalWinsEver: 0, totalLossesEver: 0, totalPnlEver: 0, fundingIncomeEver: 0, fundingByCoin: {}, fundingCursor: null }
   const s = JSON.parse(readFileSync(STATE_FILE, 'utf8'))
   if (!s.history) s.history = []
   if (!s.cooldowns) s.cooldowns = {}
   if (!s.blacklist) s.blacklist = []
+  // Initialize counters from history if they don't exist (backward compat with old state files)
+  if (s.totalTradesEver == null) {
+    s.totalTradesEver = s.history.length
+    s.totalWinsEver = s.history.filter(t => t.pnlUsd != null && t.pnlUsd > 0).length
+    s.totalLossesEver = s.history.filter(t => t.pnlUsd != null && t.pnlUsd < 0).length
+    s.totalPnlEver = s.history.reduce((sum, t) => sum + (t.pnlUsd ?? 0), 0)
+  }
+  if (s.totalPnlEver == null) s.totalPnlEver = s.history.reduce((sum, t) => sum + (t.pnlUsd ?? 0), 0)
+  // Funding income tracking (Phase 0 — measure the carry edge, separate from price PnL)
+  if (s.fundingIncomeEver == null) s.fundingIncomeEver = 0
+  if (s.fundingByCoin == null) s.fundingByCoin = {}
+  if (s.fundingCursor === undefined) s.fundingCursor = null
+  // Restore rateHistory so APR trend filter survives redeploys
+  if (s.rateHistory && typeof s.rateHistory === 'object') {
+    for (const [a, h] of Object.entries(s.rateHistory)) rateHistory[a] = h
+  }
   // Sync blacklist into EXCLUDED so scan filters it
   for (const a of s.blacklist) EXCLUDED.add(a)
   return s
@@ -139,7 +170,7 @@ async function syncPositionsFromHL() {
             isBuy, entryPrice: entryPx, openedAt: now,
             fundingAPR: 0, sizeUsd: Math.abs(szi) * entryPx,
             settlesAt: now + hoursUntilNextSettlement() * 3600000,
-            peakPrice: entryPx,
+            peakPrice: entryPx, settlementsCollected: 0,
           }
           synced++
           log(`[sync] Recovered ${isBuy?'LONG':'SHORT'} ${asset} @ ${entryPx} from Hyperliquid`)
@@ -175,18 +206,44 @@ async function getAllFundingRates() {
   } catch { return [] }
 }
 
+// Pull user funding-payment ledger from Hyperliquid. delta.usdc is signed: positive = funding RECEIVED.
+// Returns { usd, byCoin, count } summed over [startTime, endTime], or null on error (caller must not advance cursor).
+async function getUserFundingUsd(startTime, endTime) {
+  try {
+    const rows = await hl.info.userFunding({ user: identity.hl.address, startTime, endTime })
+    let usd = 0; const byCoin = {}
+    for (const r of rows ?? []) {
+      const v = parseFloat(r?.delta?.usdc ?? '0')
+      if (!isFinite(v)) continue
+      usd += v
+      byCoin[r.delta.coin] = (byCoin[r.delta.coin] ?? 0) + v
+    }
+    return { usd, byCoin, count: (rows ?? []).length }
+  } catch (e) { log('getUserFundingUsd error:', e.message); return null }
+}
+
 // Trend + volatility filter — returns { ok, reason }
 async function passesEntryFilters(asset, isBuy, aprAbs = 0) {
   try {
+    // Hard cap: APR > 1500% signals a short squeeze, not stable carry — too volatile for SL to protect
+    if (aprAbs > 1500) return { ok: false, reason: `extreme APR ${aprAbs.toFixed(0)}% > 1500% cap — squeeze risk, not stable carry` }
+
+    // Extreme NEGATIVE funding = market violently short because price is crashing.
+    // Going long to harvest it is catching a falling knife (MANTA -597% APR → -$4.4 in one trade).
+    const negAprCap = CFG.highAprThreshold ?? 300
+    if (isBuy && aprAbs > negAprCap)
+      return { ok: false, reason: `extreme negative funding ${aprAbs.toFixed(0)}% > ${negAprCap}% — crash in progress, no LONG` }
+
     const now     = Date.now()
     const candles = await hl.info.candleSnapshot({ coin: asset, interval: '1h', startTime: now - 5*3600000, endTime: now })
     if (!candles?.length) return { ok: true, reason: 'no candle data' }
 
     // Volatility gate: APR-scaled ceiling
-    // Base: CFG.maxVolatilityPct. For every 100% APR above 100%, allow +1% extra vol, cap at 3×base.
+    // Base: CFG.maxVolatilityPct. For every 100% APR above 100%, allow +1% extra vol, cap at 2×base.
+    // Capped at 2× (not 3×): high-APR assets are more volatile, not less risky.
     if (CFG.maxVolatilityPct > 0) {
       const aprBonus    = Math.max(0, (aprAbs - 100) / 100)   // extra % per 100 APR above 100%
-      const volCeiling  = Math.min(CFG.maxVolatilityPct * 3, CFG.maxVolatilityPct + aprBonus)
+      const volCeiling  = Math.min(CFG.maxVolatilityPct * 2, CFG.maxVolatilityPct + aprBonus)
       const last = candles[candles.length - 1]
       const rangePct = ((parseFloat(last.h) - parseFloat(last.l)) / parseFloat(last.l)) * 100
       if (rangePct > volCeiling)
@@ -212,6 +269,8 @@ async function passesEntryFilters(asset, isBuy, aprAbs = 0) {
 // ── POSITION MANAGEMENT ───────────────────────────────────────────────────────
 function calcPositionSize(aprAbs) {
   if (!CFG.dynamicSizing) return CFG.positionUsd
+  // Above 3× highAprThreshold (e.g. 900%) = squeeze territory — size DOWN to base (high vol, unreliable carry)
+  if (aprAbs > CFG.highAprThreshold * 3) return CFG.positionUsd
   const t = Math.min(1, Math.max(0, (aprAbs - CFG.minFundingApr) / (CFG.highAprThreshold - CFG.minFundingApr)))
   return Math.round(CFG.positionUsd + t * (CFG.maxPositionUsd - CFG.positionUsd))
 }
@@ -241,17 +300,36 @@ async function openPosition(asset, isBuy, fundingAPR) {
   return { ...result, sizeUsd }
 }
 
+// Returns { ok, exitPrice, error }. Callers MUST NOT drop the position from state unless ok.
+// A rejected close order previously went unnoticed: the bot logged the trade as closed while
+// the position stayed open on HL, unmonitored (MANTA 2026-06-30: logged -$0.84, real -$4.4).
 async function closePosition(asset, reason) {
   log(`EXIT ${asset} — ${reason}`)
   if (CFG.dryRun) {
     const mid = await hl.getMidPrice(asset)
     log(`[DRY RUN] Would close ${asset} at $${mid.toFixed(4)}`)
-    return mid
+    return { ok: true, exitPrice: mid }
   }
   const result = await hl.closePosition(asset)
-  const exitPrice = parseFloat(result?.filled?.avgPx ?? result?.avgPrice ?? 0) || null
-  log(`CLOSED ${asset}:`, exitPrice ? `avg $${exitPrice}` : result?.error)
-  return exitPrice
+  if (!result?.success) {
+    log(`CLOSE FAILED ${asset} — keeping position tracked:`, result?.error ?? 'unknown error')
+    return { ok: false, error: result?.error ?? 'unknown error' }
+  }
+  // Verify actually flat — an IOC close can "succeed" without fully filling
+  const acc   = await hl.getAccountState(identity.hl.address).catch(() => null)
+  const still = acc?.positions?.find(p =>
+    (p.asset ?? p.coin) === asset && Math.abs(parseFloat(p.size ?? p.szi ?? 0)) > 0.0001)
+  if (still) {
+    log(`CLOSE INCOMPLETE ${asset} — position still open on HL, keeping tracked`)
+    return { ok: false, error: 'position still open after close order' }
+  }
+  let exitPrice = parseFloat(result?.filled?.avgPx ?? result?.avgPrice ?? '')
+  if (!isFinite(exitPrice) || exitPrice <= 0) {
+    // fallback to mid price if close result doesn't have valid price
+    exitPrice = await hl.getMidPrice(asset).catch(() => null)
+  }
+  log(`CLOSED ${asset}:`, exitPrice ? `avg $${exitPrice.toFixed(6)}` : 'no fill price')
+  return { ok: true, exitPrice }
 }
 
 // ── SCAN ──────────────────────────────────────────────────────────────────────
@@ -260,6 +338,9 @@ async function scan() {
   if (paused)   { log('Bot paused, skipping scan'); return }
   scanning = true
   try {
+  // Recover any HL positions the bot lost track of (failed close, crash, manual trade)
+  // so they get stop-loss monitoring instead of bleeding unwatched.
+  await syncPositionsFromHL()
   const state = loadState()
   const now   = Date.now()
   lastScanAt  = now
@@ -415,6 +496,8 @@ async function scan() {
   const equity = cachedBal?.equity ?? '?'
   log(`Scan complete | equity $${equity} | open: ${Object.keys(state.positions).length}/${CFG.maxPositions} | next entry-scan in ${CFG.scanIntervalMs/1000}s`)
   log('---')
+  // Persist rateHistory so APR trend filter survives redeploys
+  await lockState(async () => { const s = loadState(); s.rateHistory = rateHistory; saveState(s) })
   } catch (e) {
     log('Scan error:', e.message)
   } finally {
@@ -447,7 +530,7 @@ async function liveRefresh() {
       lastMidPrices[asset] = mid
 
       const pricePct   = ((mid - pos.entryPrice) / pos.entryPrice) * 100
-      const adversePct = pos.isBuy ? -pricePct : pricePct
+      const adversePct = pos.isBuy ? Math.max(0, -pricePct) : Math.max(0, pricePct)
       const heldHours  = (now - pos.openedAt) / 3600000
 
       // Update trailing peak
@@ -486,7 +569,7 @@ async function liveRefresh() {
         const flipped    = Math.sign(currentAprSigned) !== Math.sign(entryAprSigned) && currentAbs > 5
         if (entryAbs >= CFG.minFundingApr && flipped) {
           exitReason = `funding-flip: APR ${entryAprSigned.toFixed(0)}% → ${currentAprSigned.toFixed(0)}% (now paying against us)`
-        } else if (entryAbs >= CFG.minFundingApr && currentAbs < entryAbs * 0.40) {
+        } else if (entryAbs >= CFG.minFundingApr && currentAbs < Math.max(entryAbs * 0.40, CFG.minFundingApr)) {
           exitReason = `funding-collapse: APR ${entryAbs.toFixed(0)}% → ${currentAbs.toFixed(0)}% (yield gone, pure directional risk now)`
         }
       }
@@ -512,10 +595,22 @@ async function liveRefresh() {
         exitReason = `max hold ${heldHours.toFixed(1)}h`
 
       if (exitReason) {
-        const exitPrice = await closePosition(asset, exitReason)
+        const closeRes = await closePosition(asset, exitReason)
+        if (!closeRes.ok) {
+          // Close rejected/incomplete — keep position tracked so SL keeps watching; retry next tick
+          pos.closeFailures = (pos.closeFailures ?? 0) + 1
+          changed = true
+          continue
+        }
+        const exitPrice = closeRes.exitPrice
         const pnlUsd    = exitPrice ? ((exitPrice - pos.entryPrice) / pos.entryPrice) * (pos.sizeUsd ?? CFG.positionUsd) * (pos.isBuy ? 1 : -1) : null
         state.history.unshift({ asset, side: pos.isBuy ? 'LONG' : 'SHORT', entryPrice: pos.entryPrice,
-          exitPrice, fundingAPR: pos.fundingAPR, openedAt: pos.openedAt, closedAt: now, reason: exitReason, pnlUsd })
+          exitPrice, fundingAPR: pos.fundingAPR, openedAt: pos.openedAt, closedAt: now, reason: exitReason, pnlUsd,
+          sizeUsd: pos.sizeUsd, settlementsCollected: pos.settlementsCollected ?? 0 })
+        state.totalTradesEver++
+        if (pnlUsd != null && pnlUsd > 0) state.totalWinsEver++
+        if (pnlUsd != null && pnlUsd < 0) state.totalLossesEver++
+        state.totalPnlEver = (state.totalPnlEver ?? 0) + (pnlUsd ?? 0)
         if (state.history.length > 100) state.history = state.history.slice(0, 100)
         if (exitReason.startsWith('stop-loss') || exitReason.startsWith('trailing-stop') || exitReason.startsWith('price-spike'))
           state.cooldowns[asset] = now + 2 * 3600000
@@ -535,6 +630,37 @@ function scheduleLiveRefresh() {
   setTimeout(async () => { await liveRefresh(); scheduleLiveRefresh() }, CFG.liveRefreshMs ?? 5000)
 }
 
+// ── FUNDING INCOME TRACKER (Phase 0) ────────────────────────────────────────────
+// Isolated from trade logic: only READS the HL funding ledger and accumulates it into state.
+// First run backfills up to 30d so the inception number is meaningful; then forward-only via cursor.
+const FUNDING_BACKFILL_MS = 30 * 24 * 3600 * 1000
+let fundingTrackerRunning = false
+async function refreshFundingIncome() {
+  if (fundingTrackerRunning) return
+  fundingTrackerRunning = true
+  try {
+    const now = Date.now()
+    const pre = loadState()
+    const start = pre.fundingCursor ?? (now - FUNDING_BACKFILL_MS)
+    if (start >= now) return
+    const res = await getUserFundingUsd(start, now)
+    if (!res) return  // error — leave cursor unchanged, retry next tick
+    await lockState(async () => {
+      const state = loadState()
+      state.fundingIncomeEver = (state.fundingIncomeEver ?? 0) + res.usd
+      state.fundingByCoin = state.fundingByCoin ?? {}
+      for (const [coin, v] of Object.entries(res.byCoin)) state.fundingByCoin[coin] = (state.fundingByCoin[coin] ?? 0) + v
+      state.fundingCursor = now
+      saveState(state)
+    })
+    if (res.count) log(`[funding] +$${res.usd.toFixed(6)} over ${res.count} payments | total $${((pre.fundingIncomeEver ?? 0) + res.usd).toFixed(4)}`)
+  } catch (e) { log('refreshFundingIncome error:', e.message) }
+  finally { fundingTrackerRunning = false }
+}
+function scheduleFundingTracker() {
+  setTimeout(async () => { await refreshFundingIncome(); scheduleFundingTracker() }, 5 * 60 * 1000)  // every 5 min
+}
+
 // ── API HANDLERS ──────────────────────────────────────────────────────────────
 function apiStatus() {
   const state  = loadState()
@@ -544,7 +670,7 @@ function apiStatus() {
   const positions = Object.entries(state.positions).map(([asset, pos]) => {
     const mid        = lastMidPrices[asset] ?? null
     const pricePct   = mid ? ((mid - pos.entryPrice) / pos.entryPrice) * 100 : null
-    const adversePct = pricePct !== null ? (pos.isBuy ? -pricePct : pricePct) : null
+    const adversePct = pricePct !== null ? (pos.isBuy ? Math.max(0, -pricePct) : Math.max(0, pricePct)) : null
     const pnlUsd     = pricePct !== null ? (pricePct / 100) * (pos.sizeUsd ?? CFG.positionUsd) * (pos.isBuy ? 1 : -1) : null
     return { asset, side: pos.isBuy ? 'LONG' : 'SHORT', entryPrice: pos.entryPrice,
       midPrice: mid, fundingAPR: pos.fundingAPR, heldHours: (Date.now() - pos.openedAt) / 3600000,
@@ -558,12 +684,15 @@ function apiStatus() {
 
   const hoursToSettle = hoursUntilNextSettlement()
   const fullHistory = state.history
-  const totalTrades = fullHistory.length
-  const totalWins   = fullHistory.filter(t => (t.pnlUsd ?? null) !== null && t.pnlUsd > 0).length
-  const totalLosses = fullHistory.filter(t => (t.pnlUsd ?? null) !== null && t.pnlUsd < 0).length
-  const totalClosedPnl = fullHistory.reduce((s, t) => s + (t.pnlUsd ?? 0), 0)
-  return { equity, avail, positions, openCount: positions.length, history: state.history.slice(0, 50),
+  const totalTrades    = state.totalTradesEver ?? fullHistory.length
+  const totalWins      = state.totalWinsEver ?? fullHistory.filter(t => t.pnlUsd != null && t.pnlUsd > 0).length
+  const totalLosses    = state.totalLossesEver ?? fullHistory.filter(t => t.pnlUsd != null && t.pnlUsd < 0).length
+  const totalClosedPnl = state.totalPnlEver ?? fullHistory.reduce((s, t) => s + (t.pnlUsd ?? 0), 0)
+  const fundingIncomeEver = state.fundingIncomeEver ?? 0
+  const netRealisedEver   = totalClosedPnl + fundingIncomeEver
+  return { equity, avail, positions, openCount: positions.length, history: state.history.slice(0, 100),
     totalTrades, totalWins, totalLosses, totalClosedPnl,
+    fundingIncomeEver, fundingByCoin: state.fundingByCoin ?? {}, netRealisedEver,
     rates, paused, scanning, cfg: CFG, mode: CFG.dryRun ? 'DRY RUN' : 'LIVE',
     wallet: identity.hl.address, hoursToSettle, scanDecisions, lastScanAt,
     regime: btcFundingRegime, crowdedRatio: crowdedLongRatio, startedAt: BOOT_TS,
@@ -573,9 +702,11 @@ function apiStatus() {
 async function apiClose(asset) {
   const pre = loadState()
   if (!pre.positions[asset]) return { error: 'Position not found' }
-  const pos       = pre.positions[asset]
-  const mid       = await hl.getMidPrice(asset).catch(() => null)
-  const exitPrice = await closePosition(asset, 'manual close from dashboard') ?? mid
+  const pos      = pre.positions[asset]
+  const mid      = await hl.getMidPrice(asset).catch(() => null)
+  const closeRes = await closePosition(asset, 'manual close from dashboard')
+  if (!closeRes.ok) return { error: `Close failed: ${closeRes.error}` }
+  const exitPrice = closeRes.exitPrice ?? mid
   const pricePct  = exitPrice ? ((exitPrice - pos.entryPrice) / pos.entryPrice) * 100 : null
   const pnlUsd    = pricePct !== null ? (pricePct / 100) * (pos.sizeUsd ?? CFG.positionUsd) * (pos.isBuy ? 1 : -1) : null
   await lockState(async () => {
@@ -583,7 +714,11 @@ async function apiClose(asset) {
     if (!state.positions[asset]) return
     state.history.unshift({ asset, side: pos.isBuy ? 'LONG' : 'SHORT', entryPrice: pos.entryPrice,
       exitPrice, fundingAPR: pos.fundingAPR, openedAt: pos.openedAt, closedAt: Date.now(),
-      reason: 'manual', pnlUsd })
+      reason: 'manual', pnlUsd, sizeUsd: pos.sizeUsd, settlementsCollected: pos.settlementsCollected ?? 0 })
+    state.totalTradesEver++
+    if (pnlUsd != null && pnlUsd > 0) state.totalWinsEver++
+    if (pnlUsd != null && pnlUsd < 0) state.totalLossesEver++
+    state.totalPnlEver = (state.totalPnlEver ?? 0) + (pnlUsd ?? 0)
     delete state.positions[asset]
     saveState(state)
   })
@@ -598,6 +733,7 @@ const HTML = `<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#0C0A07">
 <title>Funding Bot — Console</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230C0A07'/%3E%3Cpath d='M17.8 3.5 7.6 18.4h6.1l-1.7 10.1L24.4 13.3h-6.5z' fill='%23FFB454'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,600;12..96,700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -673,6 +809,7 @@ body{
 .chip.live .dot{animation:breathe 2.4s ease-in-out infinite}
 @keyframes breathe{0%,100%{opacity:1}50%{opacity:0.35}}
 .top .updated{margin-left:auto;font-size:11px;color:var(--faint);white-space:nowrap}
+.top .updated.err{color:var(--red)}
 
 /* ── LAYOUT ─────────────────────────────────────────── */
 .wrap{
@@ -715,13 +852,18 @@ body{
 @keyframes sweep{to{left:130%}}
 
 /* ── INSTRUMENT STRIP ───────────────────────────────── */
+/* 8 cards — 4 across gives two full rows rather than orphaning the last two */
 .strip{
-  display:grid;grid-template-columns:repeat(6,1fr);
+  display:grid;grid-template-columns:repeat(4,1fr);
   background:var(--panel);border:1px solid var(--line);border-radius:6px;
   overflow:hidden;
 }
-.cell{padding:13px 16px 11px;border-right:1px solid var(--line);min-width:0}
-.cell:last-child{border-right:none}
+.cell{
+  padding:13px 16px 11px;min-width:0;
+  border-right:1px solid var(--line);border-bottom:1px solid var(--line);
+}
+.cell:nth-child(4n){border-right:none}
+.cell:nth-last-child(-n+4){border-bottom:none}
 .cell .lbl{font-size:9.5px;letter-spacing:0.14em;color:var(--muted);text-transform:uppercase;margin-bottom:5px}
 .cell .val{
   font-size:21px;font-weight:600;letter-spacing:-0.01em;
@@ -734,7 +876,13 @@ body{
 .flash-down{animation:fdn 0.7s ease-out}
 @keyframes fup{0%{color:var(--green);text-shadow:0 0 12px rgba(70,214,140,0.5)}100%{}}
 @keyframes fdn{0%{color:var(--red);text-shadow:0 0 12px rgba(242,92,92,0.5)}100%{}}
-@media (max-width:900px){.strip{grid-template-columns:repeat(3,1fr)}.cell:nth-child(3){border-right:none}.cell:nth-child(-n+3){border-bottom:1px solid var(--line)}}
+@media (max-width:900px){
+  .strip{grid-template-columns:repeat(2,1fr)}
+  .cell:nth-child(4n){border-right:1px solid var(--line)}
+  .cell:nth-child(2n){border-right:none}
+  .cell:nth-last-child(-n+4){border-bottom:1px solid var(--line)}
+  .cell:nth-last-child(-n+2){border-bottom:none}
+}
 
 /* ── SETTLEMENT DIAL ────────────────────────────────── */
 .dial-panel{padding:18px 16px 16px;text-align:center}
@@ -781,11 +929,16 @@ body{
 .cfg-panel.open{display:block}
 .cfg-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px 12px;margin-top:10px}
 .cfg-field{display:flex;flex-direction:column;gap:4px;min-width:0}
-.cfg-field label{font-size:9px;letter-spacing:0.1em;text-transform:uppercase;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* labels wrap instead of truncating; inputs margin-top:auto so a wrapped label
+   in one column still leaves both inputs on the row bottom-aligned */
+.cfg-field label{
+  font-size:9px;letter-spacing:0.08em;text-transform:uppercase;color:var(--muted);
+  line-height:1.35;
+}
 .cfg-field input,.cfg-field select{
   font-family:'IBM Plex Mono',monospace;font-size:12px;
   background:var(--bg);border:1px solid var(--line2);color:var(--ink);
-  padding:6px 8px;border-radius:3px;width:100%;
+  padding:6px 8px;border-radius:3px;width:100%;margin-top:auto;
 }
 .cfg-field input:focus,.cfg-field select:focus{border-color:var(--amber-line);outline:none}
 .btn-save{margin-top:12px}
@@ -936,6 +1089,8 @@ tbody.fresh tr{animation:rowin 0.3s ease-out backwards;animation-delay:calc(var(
         <div class="lbl">Realised P&amp;L</div><div class="val" id="closedPnl">—</div>
         <div class="sub"><span class="green"><span id="winCount">0</span>W</span> · <span class="red"><span id="lossCount">0</span>L</span> · <span id="winRate">—</span> WR</div>
       </div>
+      <div class="cell"><div class="lbl">Funding Collected</div><div class="val" id="fundingPnl">—</div></div>
+      <div class="cell"><div class="lbl">Net Realised</div><div class="val" id="netPnl">—</div><div class="sub">price + funding</div></div>
       <div class="cell"><div class="lbl">Positions</div><div class="val" id="openCount">—</div></div>
       <div class="cell"><div class="lbl">Trades</div><div class="val" id="totalTrades">—</div></div>
     </div>
@@ -976,7 +1131,7 @@ tbody.fresh tr{animation:rowin 0.3s ease-out backwards;animation-delay:calc(var(
     <!-- PnL Chart -->
     <div class="panel">
       <div class="panel-head">
-        <h2>P&amp;L Since Inception</h2>
+        <h2>Realised P&amp;L</h2>
         <span class="meta" id="pnlChartTotal"></span>
         <span class="right"><span class="green">●</span> win&nbsp;&nbsp;<span class="red">●</span> loss</span>
       </div>
@@ -1091,6 +1246,14 @@ tbody.fresh tr{animation:rowin 0.3s ease-out backwards;animation-delay:calc(var(
 function $(id){ return document.getElementById(id) }
 function fmt(n, d){ if(d===undefined)d=2; return (n!=null && isFinite(n)) ? n.toFixed(d) : '—' }
 function fmtUsd(n){ return (n!=null && isFinite(n)) ? ((n>=0?'+':'-')+'$'+Math.abs(n).toFixed(3)) : '—' }
+// Prices span BTC (~100k) to sub-cent alts — scale decimals to magnitude so
+// cheap assets don't all render as "0.0000".
+function fmtPrice(n){
+  if(n==null || !isFinite(n)) return '—'
+  var a = Math.abs(n)
+  var d = a>=1000 ? 2 : a>=1 ? 4 : a>=0.01 ? 5 : a>=0.0001 ? 7 : 9
+  return n.toFixed(d)
+}
 function fmtDate(ts){ return ts ? new Date(ts).toLocaleString() : '—' }
 function pnlClass(n){ return n>0?'green':n<0?'red':'' }
 function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') }
@@ -1272,7 +1435,8 @@ function renderRatesPage(rates, page){
       + '<td class="dim" style="font-size:11px">'+vol+'</td>'
       + '<td>'+sig+'</td></tr>')
   }
-  $('ratesTbody').innerHTML = rows.join('')
+  $('ratesTbody').innerHTML = rows.length ? rows.join('')
+    : '<tr><td colspan="5" class="empty">No asset matches “'+esc(rateQuery)+'”</td></tr>'
   $('ratesPager').style.display = rates.length > PAGE_SIZE ? 'flex' : 'none'
   $('pgNum').textContent = page; $('pgTotal').textContent = total
   $('pgShowing').textContent = (start+1) + '–' + Math.min(start+PAGE_SIZE, rates.length)
@@ -1280,9 +1444,9 @@ function renderRatesPage(rates, page){
 }
 
 function renderHistPage(hist, page){
-  _allHist = hist; _hpage = page
   var total = Math.max(1, Math.ceil(hist.length/PAGE_SIZE))
-  if(page > total) page = total
+  page = Math.min(Math.max(1, page), total)   // clamp before caching, or _hpage drifts past the last page
+  _allHist = hist; _hpage = page
   var start = (page-1)*PAGE_SIZE, slice = hist.slice(start, start+PAGE_SIZE)
   var rows = []
   for(var i=0;i<slice.length;i++){
@@ -1291,8 +1455,8 @@ function renderHistPage(hist, page){
     var apr = (t.fundingAPR>=0?'+':'') + fmt(t.fundingAPR,1) + '%'
     rows.push('<tr><td><b>'+esc(t.asset)+'</b></td>'
       + '<td><span class="pill '+t.side.toLowerCase()+'">'+t.side+'</span></td>'
-      + '<td>'+fmt(t.entryPrice,4)+'</td>'
-      + '<td>'+fmt(t.exitPrice,4)+'</td>'
+      + '<td>'+fmtPrice(t.entryPrice)+'</td>'
+      + '<td>'+fmtPrice(t.exitPrice)+'</td>'
       + '<td>'+apr+'</td>'
       + '<td>'+held+'</td>'
       + '<td class="'+pnlClass(t.pnlUsd)+'">'+fmtUsd(t.pnlUsd)+'</td>'
@@ -1307,13 +1471,19 @@ function renderHistPage(hist, page){
 }
 
 // ── pnl chart ────────────────────────────────────────
-var _pnlChart = null
+var _pnlChart = null, _pnlSig = null
 function buildPnlChart(history){
   var sorted = history.filter(function(t){ return t.closedAt && t.pnlUsd != null })
     .sort(function(a,b){ return a.closedAt - b.closedAt })
   var emptyEl = $('pnlEmpty'), canvasEl = $('pnlChart')
   if(!sorted.length){ emptyEl.style.display='flex'; canvasEl.style.display='none'; return }
   emptyEl.style.display='none'; canvasEl.style.display='block'
+
+  // Only rebuild when the trade set actually changed — otherwise the 15s poll
+  // destroys and re-animates the chart, flickering and killing open tooltips.
+  var sig = sorted.map(function(t){ return t.closedAt+':'+t.pnlUsd }).join('|')
+  if(sig === _pnlSig && _pnlChart) return
+  _pnlSig = sig
 
   var cum = 0
   var lineData = [{x:new Date(sorted[0].closedAt-1), y:0}]
@@ -1326,7 +1496,9 @@ function buildPnlChart(history){
   })
 
   var tot = $('pnlChartTotal')
-  tot.textContent = (cum>=0?'+':'') + '$' + cum.toFixed(4)
+  // Label the trade count: this chart is the retained window, while the
+  // "Realised P&L" tile is the all-time persistent counter — they differ by design.
+  tot.textContent = fmtUsd(cum) + ' · ' + sorted.length + ' trades'
   tot.style.color = cum>=0 ? '#46D68C' : '#F25C5C'
 
   var ctx = canvasEl.getContext('2d')
@@ -1366,10 +1538,10 @@ function buildPnlChart(history){
             label:function(item){
               var d = item.dataset.data[item.dataIndex]
               if(!d.trade) return 'PnL: $0.00'
-              var t = d.trade, sign = t.pnlUsd>=0?'+':''
+              var t = d.trade
               return [
-                'trade: ' + sign + '$' + t.pnlUsd.toFixed(4),
-                'total: $' + item.parsed.y.toFixed(4),
+                'trade: ' + fmtUsd(t.pnlUsd),
+                'total: ' + fmtUsd(item.parsed.y),
                 'apr: ' + (t.fundingAPR>=0?'+':'') + (t.fundingAPR||0).toFixed(1) + '%',
                 'exit: ' + (t.reason||'—'),
                 new Date(t.closedAt).toLocaleString()
@@ -1467,6 +1639,7 @@ async function refresh(){
     cfg = d.cfg
 
     $('ts').textContent = 'updated ' + new Date(d.ts).toLocaleTimeString()
+    $('ts').classList.remove('err')
 
     var mb = $('modeBadge')
     mb.innerHTML = (d.mode==='LIVE' ? '<span class="dot"></span>' : '') + d.mode
@@ -1493,6 +1666,10 @@ async function refresh(){
     setVal('openPnl', fmtUsd(openPnl), openPnl, openPnl>0?'pos':openPnl<0?'neg':'', fmtUsd)
     var closedPnl = d.totalClosedPnl != null ? d.totalClosedPnl : d.history.reduce(function(s,t){return s+(t.pnlUsd||0)},0)
     setVal('closedPnl', fmtUsd(closedPnl), closedPnl, closedPnl>0?'pos':closedPnl<0?'neg':'', fmtUsd)
+    var fundingPnl = d.fundingIncomeEver || 0
+    setVal('fundingPnl', fmtUsd(fundingPnl), fundingPnl, fundingPnl>0?'pos':fundingPnl<0?'neg':'', fmtUsd)
+    var netPnl = (d.netRealisedEver != null) ? d.netRealisedEver : (closedPnl + fundingPnl)
+    setVal('netPnl', fmtUsd(netPnl), netPnl, netPnl>0?'pos':netPnl<0?'neg':'', fmtUsd)
     var wins = d.totalWins||0, losses = d.totalLosses||0
     $('winCount').textContent = wins; $('lossCount').textContent = losses
     $('winRate').textContent = (wins+losses) ? Math.round(wins/(wins+losses)*100)+'%' : '—'
@@ -1553,8 +1730,8 @@ async function refresh(){
         var apr = (p.fundingAPR>=0?'+':'') + fmt(p.fundingAPR,1) + '%'
         return '<tr><td><b>'+esc(p.asset)+'</b></td>'
           + '<td><span class="pill '+p.side.toLowerCase()+'">'+p.side+'</span></td>'
-          + '<td>'+fmt(p.entryPrice,4)+'</td>'
-          + '<td>'+fmt(p.midPrice,4)+'</td>'
+          + '<td>'+fmtPrice(p.entryPrice)+'</td>'
+          + '<td>'+fmtPrice(p.midPrice)+'</td>'
           + '<td>'+sparkSvg(p.asset, (p.pnlUsd||0) >= 0)+'</td>'
           + '<td class="'+(p.fundingAPR<0?'green':'red')+'">'+apr+'</td>'
           + '<td>'+held+'<div class="settle-in" data-settle="'+(p.settlesAt||'')+'"></div></td>'
@@ -1601,7 +1778,8 @@ async function refresh(){
     hc.style.display = totalH ? 'inline-block' : 'none'
     if(d.history.length) renderHistPage(d.history, _hpage)
   } catch(e){
-    $('ts').textContent = 'error: ' + e.message
+    $('ts').textContent = 'connection lost — retrying'
+    $('ts').classList.add('err')
   }
 }
 
@@ -1692,9 +1870,11 @@ setInterval(refresh, 15000)
 // ── HTTP SERVER ────────────────────────────────────────────────────────────────
 createServer(async (req, res) => {
   try {
-  log(`HTTP ${req.method} ${req.url}`)
   const url    = req.url
   const method = req.method
+  // Skip the high-frequency polls — the dashboard hits /api/status every 15s and
+  // the platform health check runs continuously; logging both buries real events.
+  if (url !== '/api/status' && url !== '/health') log(`HTTP ${method} ${url}`)
 
   const json = (data, code=200) => {
     res.writeHead(code, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
@@ -1761,3 +1941,5 @@ await syncPositionsFromHL()
 await scan()
 scheduleScan()
 scheduleLiveRefresh()
+refreshFundingIncome()      // prime funding income on boot (read-only)
+scheduleFundingTracker()    // then refresh every 5 min
