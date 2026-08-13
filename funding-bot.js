@@ -733,6 +733,7 @@ const HTML = `<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#0C0A07">
 <title>Funding Bot — Console</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230C0A07'/%3E%3Cpath d='M17.8 3.5 7.6 18.4h6.1l-1.7 10.1L24.4 13.3h-6.5z' fill='%23FFB454'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,600;12..96,700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -808,6 +809,7 @@ body{
 .chip.live .dot{animation:breathe 2.4s ease-in-out infinite}
 @keyframes breathe{0%,100%{opacity:1}50%{opacity:0.35}}
 .top .updated{margin-left:auto;font-size:11px;color:var(--faint);white-space:nowrap}
+.top .updated.err{color:var(--red)}
 
 /* ── LAYOUT ─────────────────────────────────────────── */
 .wrap{
@@ -850,13 +852,18 @@ body{
 @keyframes sweep{to{left:130%}}
 
 /* ── INSTRUMENT STRIP ───────────────────────────────── */
+/* 8 cards — 4 across gives two full rows rather than orphaning the last two */
 .strip{
-  display:grid;grid-template-columns:repeat(6,1fr);
+  display:grid;grid-template-columns:repeat(4,1fr);
   background:var(--panel);border:1px solid var(--line);border-radius:6px;
   overflow:hidden;
 }
-.cell{padding:13px 16px 11px;border-right:1px solid var(--line);min-width:0}
-.cell:last-child{border-right:none}
+.cell{
+  padding:13px 16px 11px;min-width:0;
+  border-right:1px solid var(--line);border-bottom:1px solid var(--line);
+}
+.cell:nth-child(4n){border-right:none}
+.cell:nth-last-child(-n+4){border-bottom:none}
 .cell .lbl{font-size:9.5px;letter-spacing:0.14em;color:var(--muted);text-transform:uppercase;margin-bottom:5px}
 .cell .val{
   font-size:21px;font-weight:600;letter-spacing:-0.01em;
@@ -869,7 +876,13 @@ body{
 .flash-down{animation:fdn 0.7s ease-out}
 @keyframes fup{0%{color:var(--green);text-shadow:0 0 12px rgba(70,214,140,0.5)}100%{}}
 @keyframes fdn{0%{color:var(--red);text-shadow:0 0 12px rgba(242,92,92,0.5)}100%{}}
-@media (max-width:900px){.strip{grid-template-columns:repeat(3,1fr)}.cell:nth-child(3){border-right:none}.cell:nth-child(-n+3){border-bottom:1px solid var(--line)}}
+@media (max-width:900px){
+  .strip{grid-template-columns:repeat(2,1fr)}
+  .cell:nth-child(4n){border-right:1px solid var(--line)}
+  .cell:nth-child(2n){border-right:none}
+  .cell:nth-last-child(-n+4){border-bottom:1px solid var(--line)}
+  .cell:nth-last-child(-n+2){border-bottom:none}
+}
 
 /* ── SETTLEMENT DIAL ────────────────────────────────── */
 .dial-panel{padding:18px 16px 16px;text-align:center}
@@ -916,11 +929,16 @@ body{
 .cfg-panel.open{display:block}
 .cfg-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px 12px;margin-top:10px}
 .cfg-field{display:flex;flex-direction:column;gap:4px;min-width:0}
-.cfg-field label{font-size:9px;letter-spacing:0.1em;text-transform:uppercase;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* labels wrap instead of truncating; inputs margin-top:auto so a wrapped label
+   in one column still leaves both inputs on the row bottom-aligned */
+.cfg-field label{
+  font-size:9px;letter-spacing:0.08em;text-transform:uppercase;color:var(--muted);
+  line-height:1.35;
+}
 .cfg-field input,.cfg-field select{
   font-family:'IBM Plex Mono',monospace;font-size:12px;
   background:var(--bg);border:1px solid var(--line2);color:var(--ink);
-  padding:6px 8px;border-radius:3px;width:100%;
+  padding:6px 8px;border-radius:3px;width:100%;margin-top:auto;
 }
 .cfg-field input:focus,.cfg-field select:focus{border-color:var(--amber-line);outline:none}
 .btn-save{margin-top:12px}
@@ -1228,6 +1246,14 @@ tbody.fresh tr{animation:rowin 0.3s ease-out backwards;animation-delay:calc(var(
 function $(id){ return document.getElementById(id) }
 function fmt(n, d){ if(d===undefined)d=2; return (n!=null && isFinite(n)) ? n.toFixed(d) : '—' }
 function fmtUsd(n){ return (n!=null && isFinite(n)) ? ((n>=0?'+':'-')+'$'+Math.abs(n).toFixed(3)) : '—' }
+// Prices span BTC (~100k) to sub-cent alts — scale decimals to magnitude so
+// cheap assets don't all render as "0.0000".
+function fmtPrice(n){
+  if(n==null || !isFinite(n)) return '—'
+  var a = Math.abs(n)
+  var d = a>=1000 ? 2 : a>=1 ? 4 : a>=0.01 ? 5 : a>=0.0001 ? 7 : 9
+  return n.toFixed(d)
+}
 function fmtDate(ts){ return ts ? new Date(ts).toLocaleString() : '—' }
 function pnlClass(n){ return n>0?'green':n<0?'red':'' }
 function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') }
@@ -1409,7 +1435,8 @@ function renderRatesPage(rates, page){
       + '<td class="dim" style="font-size:11px">'+vol+'</td>'
       + '<td>'+sig+'</td></tr>')
   }
-  $('ratesTbody').innerHTML = rows.join('')
+  $('ratesTbody').innerHTML = rows.length ? rows.join('')
+    : '<tr><td colspan="5" class="empty">No asset matches “'+esc(rateQuery)+'”</td></tr>'
   $('ratesPager').style.display = rates.length > PAGE_SIZE ? 'flex' : 'none'
   $('pgNum').textContent = page; $('pgTotal').textContent = total
   $('pgShowing').textContent = (start+1) + '–' + Math.min(start+PAGE_SIZE, rates.length)
@@ -1417,9 +1444,9 @@ function renderRatesPage(rates, page){
 }
 
 function renderHistPage(hist, page){
-  _allHist = hist; _hpage = page
   var total = Math.max(1, Math.ceil(hist.length/PAGE_SIZE))
-  if(page > total) page = total
+  page = Math.min(Math.max(1, page), total)   // clamp before caching, or _hpage drifts past the last page
+  _allHist = hist; _hpage = page
   var start = (page-1)*PAGE_SIZE, slice = hist.slice(start, start+PAGE_SIZE)
   var rows = []
   for(var i=0;i<slice.length;i++){
@@ -1428,8 +1455,8 @@ function renderHistPage(hist, page){
     var apr = (t.fundingAPR>=0?'+':'') + fmt(t.fundingAPR,1) + '%'
     rows.push('<tr><td><b>'+esc(t.asset)+'</b></td>'
       + '<td><span class="pill '+t.side.toLowerCase()+'">'+t.side+'</span></td>'
-      + '<td>'+fmt(t.entryPrice,4)+'</td>'
-      + '<td>'+fmt(t.exitPrice,4)+'</td>'
+      + '<td>'+fmtPrice(t.entryPrice)+'</td>'
+      + '<td>'+fmtPrice(t.exitPrice)+'</td>'
       + '<td>'+apr+'</td>'
       + '<td>'+held+'</td>'
       + '<td class="'+pnlClass(t.pnlUsd)+'">'+fmtUsd(t.pnlUsd)+'</td>'
@@ -1444,13 +1471,19 @@ function renderHistPage(hist, page){
 }
 
 // ── pnl chart ────────────────────────────────────────
-var _pnlChart = null
+var _pnlChart = null, _pnlSig = null
 function buildPnlChart(history){
   var sorted = history.filter(function(t){ return t.closedAt && t.pnlUsd != null })
     .sort(function(a,b){ return a.closedAt - b.closedAt })
   var emptyEl = $('pnlEmpty'), canvasEl = $('pnlChart')
   if(!sorted.length){ emptyEl.style.display='flex'; canvasEl.style.display='none'; return }
   emptyEl.style.display='none'; canvasEl.style.display='block'
+
+  // Only rebuild when the trade set actually changed — otherwise the 15s poll
+  // destroys and re-animates the chart, flickering and killing open tooltips.
+  var sig = sorted.map(function(t){ return t.closedAt+':'+t.pnlUsd }).join('|')
+  if(sig === _pnlSig && _pnlChart) return
+  _pnlSig = sig
 
   var cum = 0
   var lineData = [{x:new Date(sorted[0].closedAt-1), y:0}]
@@ -1463,7 +1496,9 @@ function buildPnlChart(history){
   })
 
   var tot = $('pnlChartTotal')
-  tot.textContent = (cum>=0?'+':'') + '$' + cum.toFixed(4)
+  // Label the trade count: this chart is the retained window, while the
+  // "Realised P&L" tile is the all-time persistent counter — they differ by design.
+  tot.textContent = fmtUsd(cum) + ' · ' + sorted.length + ' trades'
   tot.style.color = cum>=0 ? '#46D68C' : '#F25C5C'
 
   var ctx = canvasEl.getContext('2d')
@@ -1503,10 +1538,10 @@ function buildPnlChart(history){
             label:function(item){
               var d = item.dataset.data[item.dataIndex]
               if(!d.trade) return 'PnL: $0.00'
-              var t = d.trade, sign = t.pnlUsd>=0?'+':''
+              var t = d.trade
               return [
-                'trade: ' + sign + '$' + t.pnlUsd.toFixed(4),
-                'total: $' + item.parsed.y.toFixed(4),
+                'trade: ' + fmtUsd(t.pnlUsd),
+                'total: ' + fmtUsd(item.parsed.y),
                 'apr: ' + (t.fundingAPR>=0?'+':'') + (t.fundingAPR||0).toFixed(1) + '%',
                 'exit: ' + (t.reason||'—'),
                 new Date(t.closedAt).toLocaleString()
@@ -1604,6 +1639,7 @@ async function refresh(){
     cfg = d.cfg
 
     $('ts').textContent = 'updated ' + new Date(d.ts).toLocaleTimeString()
+    $('ts').classList.remove('err')
 
     var mb = $('modeBadge')
     mb.innerHTML = (d.mode==='LIVE' ? '<span class="dot"></span>' : '') + d.mode
@@ -1694,8 +1730,8 @@ async function refresh(){
         var apr = (p.fundingAPR>=0?'+':'') + fmt(p.fundingAPR,1) + '%'
         return '<tr><td><b>'+esc(p.asset)+'</b></td>'
           + '<td><span class="pill '+p.side.toLowerCase()+'">'+p.side+'</span></td>'
-          + '<td>'+fmt(p.entryPrice,4)+'</td>'
-          + '<td>'+fmt(p.midPrice,4)+'</td>'
+          + '<td>'+fmtPrice(p.entryPrice)+'</td>'
+          + '<td>'+fmtPrice(p.midPrice)+'</td>'
           + '<td>'+sparkSvg(p.asset, (p.pnlUsd||0) >= 0)+'</td>'
           + '<td class="'+(p.fundingAPR<0?'green':'red')+'">'+apr+'</td>'
           + '<td>'+held+'<div class="settle-in" data-settle="'+(p.settlesAt||'')+'"></div></td>'
@@ -1742,7 +1778,8 @@ async function refresh(){
     hc.style.display = totalH ? 'inline-block' : 'none'
     if(d.history.length) renderHistPage(d.history, _hpage)
   } catch(e){
-    $('ts').textContent = 'error: ' + e.message
+    $('ts').textContent = 'connection lost — retrying'
+    $('ts').classList.add('err')
   }
 }
 
@@ -1833,9 +1870,11 @@ setInterval(refresh, 15000)
 // ── HTTP SERVER ────────────────────────────────────────────────────────────────
 createServer(async (req, res) => {
   try {
-  log(`HTTP ${req.method} ${req.url}`)
   const url    = req.url
   const method = req.method
+  // Skip the high-frequency polls — the dashboard hits /api/status every 15s and
+  // the platform health check runs continuously; logging both buries real events.
+  if (url !== '/api/status' && url !== '/health') log(`HTTP ${method} ${url}`)
 
   const json = (data, code=200) => {
     res.writeHead(code, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
